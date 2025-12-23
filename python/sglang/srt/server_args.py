@@ -450,6 +450,8 @@ class ServerArgs:
     hicache_storage_backend_extra_config: Optional[str] = None
     # LMCache
     enable_lmcache: bool = False
+    # Logits Cache
+    enable_logits_cache: bool = False
 
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
@@ -3317,6 +3319,11 @@ class ServerArgs:
             "--enable-lmcache",
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
+        )
+        # Logits Cache
+        parser.add_argument(
+            "--enable-logits-cache",
+            action="store_true",
         )
 
         # Ktransformer server args

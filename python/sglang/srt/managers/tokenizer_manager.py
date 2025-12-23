@@ -880,6 +880,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
+                logits_cached=obj.logits_cached,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,

@@ -1,0 +1,730 @@
+from __future__ import annotations
+import heapq
+import time
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from collections import defaultdict
+from functools import lru_cache, partial
+from typing import TYPE_CHECKING, List, Optional, Tuple, Dict
+from dataclasses import dataclass, field
+import torch
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+)
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.evict_policy import (
+    EvictionStrategy,
+    FIFOStrategy,
+    FILOStrategy,
+    LFUStrategy,
+    LRUStrategy,
+    MRUStrategy,
+)
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.server_args import get_global_server_args, ServerArgs
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.configs.model_config import ModelConfig
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.scheduler import GenerationBatchResult
+
+
+@dataclass
+class Recorder:
+    _input: torch.Tensor = field(default_factory=lambda: torch.tensor([], dtype=torch.int32))
+    _output: torch.Tensor = field(default_factory=lambda: torch.tensor([], dtype=torch.int32))
+
+    @staticmethod
+    def _to_tensor(data: List | torch.Tensor) -> torch.Tensor:
+        return torch.tensor(data, dtype=torch.int32) if isinstance(data, List) else data
+
+    @property
+    def all_tok(self) -> torch.Tensor:
+        self._input = self._to_tensor(self._input)
+        self._output = self._to_tensor(self._output)
+        return torch.cat([self._input, self._output], dim=0)
+
+@dataclass
+class LogitsRecord:
+    req_to_token_pool: ReqToTokenPool
+    server_args: ServerArgs
+    req_logits_key: Dict[str, List[LogitsKey]] | None = None
+    logits_cache: Dict[str, LogitsCache] | None = None
+    req_kv_ind: Dict[str, Recorder] | None = None # record the req's kv indices
+    req_tok: Dict[str, Recorder] | None = None    # record the req's token
+    _sampler: Optional[object] = field(default=None, repr=False)
+    model_config: Optional[ModelConfig] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        self.model_config = ModelConfig.from_server_args(self.server_args)
+        if self.server_args.enable_logits_cache:
+            self.req_logits_key = {}
+            self.logits_cache = {}
+            self.req_kv_ind = {}
+            self.req_tok = {}
+
+    @property
+    def sampler(self):
+        if self._sampler is None:
+            from sglang.srt.layers.sampler import Sampler
+            self._sampler = Sampler()
+        return self._sampler
+
+    @property
+    def enable_logits_cache(self) -> bool:
+        return self.req_logits_key is not None
+
+    def record_batch(self, batch: ScheduleBatch, logits_info: GenerationBatchResult):
+        if self.enable_logits_cache is False:
+            return
+        logits = logits_info.logits_output.next_token_logits
+        logits_results = logits_info.next_token_ids
+        for ind, req in enumerate(batch.reqs):
+            if req.rid in self.req_logits_key:
+                self.req_logits_key[req.rid].append(LogitsKey(logits[ind], logits_results[ind]))
+                continue
+            # if batch.forward_mode.is_decode():
+            #   committed_kv_len = req.kv_committed_len
+            #   ins_kv_indices = []
+            #   out_kv_indices = self.req_to_token_pool.req_to_token[
+            #   req.req_pool_idx, len(req.origin_input_ids):committed_kv_len
+            #   ]
+            assert batch.forward_mode.is_extend(), "encounter strange mode"
+            start_ind = sum(batch.extend_lens[:ind])
+            ins_kv_indices = batch.out_cache_loc[start_ind : batch.extend_lens[ind]]
+
+            self.req_logits_key[req.rid] = [LogitsKey(logits[ind], logits_results[ind])]
+            self.req_kv_ind[req.rid] = Recorder(ins_kv_indices, [])
+            self.req_tok[req.rid] = Recorder(req.origin_input_ids, [])
+            self.logits_cache[req.rid] = LogitsCache(page_size=1, disable=False)
+
+    def summary(self, rid: str) -> Optional[Tuple[torch.Tensor, List[int]]]:
+        if self.enable_logits_cache is False:
+            return None
+        assert rid in self.req_logits_key, "rid must stored at req_logits_key"
+        logits_seq = self.req_logits_key[rid]
+        history_logits = torch.stack([key.logits for key in logits_seq], dim=0)
+        token_ids = [
+            key.logits_result.item() if isinstance(key.logits_result, torch.Tensor) else key.logits_result
+            for key in logits_seq
+        ]
+        return history_logits, token_ids
+        
+    def update_req(self, req: Req, history_logits: torch.Tensor):
+        if self.enable_logits_cache is False:
+            return
+        committed_kv_len = req.kv_committed_len
+        logits_token_ids = req.output_ids[:committed_kv_len - len(req.origin_input_ids)]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, len(req.origin_input_ids):committed_kv_len
+        ]
+        self.req_kv_ind[req.rid]._output = kv_indices
+        self.req_tok[req.rid]._output = req.output_ids
+        cache_tree = self.logits_cache[req.rid]
+        cache_tree.insert(LogitsKey(history_logits, logits_token_ids))
+        cache_tree.init_time = time.monotonic() # update timing
+        # clear request info
+        self.req_logits_key.pop(req.rid)
+
+    def get_logits_cache(self, req: Req) -> bool:
+        if self.enable_logits_cache is False:
+            return False
+        if req.rid not in self.logits_cache:
+            return False
+        
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        node = self.logits_cache[req.rid].root_node
+        sampling_batch_info = self.generate_sampling_info([req])
+        req_tok = self.req_tok[req.rid]
+        for i in range(len(node.key.logits_result)):
+            cur_logit = LogitsProcessorOutput(next_token_logits=node.key.logits[i:i+1])
+            cur_logit_res = node.key.logits_result[i]
+            
+            nxt_id = self.sampler(
+                logits_output=cur_logit, 
+                sampling_info=sampling_batch_info,
+                return_logprob=False,
+                top_logprobs_nums=[],
+                token_ids_logprobs=[],
+                positions=req.seqlen,
+                )
+            if cur_logit_res != nxt_id:
+                # TODO split the tree
+                ...
+            print(nxt_id)
+            req.output_ids.append(cur_logit_res)
+            # req.
+        # update request info
+        req.fill_ids = req_tok.all_tok
+        req.origin_input_ids = req_tok.all_tok
+        req.prefix_indices = self.req_kv_ind[req.rid].all_tok
+        req.extend_input_len = 1 # set this to 1
+        return True
+
+        # logits_output = LogitsProcessorOutput(next_token_logits=sampled_logits)
+        # logits_cache = self.logits_cache[rid]
+        # logits_cache.get_sample_result()
+        
+    def generate_sampling_info(self,reqs: List[Req]) -> SamplingBatchInfo:
+        global_server_args = get_global_server_args()
+        enable_deterministic = global_server_args.enable_deterministic_inference
+        vocab_size = self.model_config.vocab_size
+        
+        temperatures = torch.tensor(
+            [r.sampling_params.temperature for r in reqs],
+            dtype=torch.float,
+            device='cpu'
+        ).view(-1, 1)
+        top_ps = torch.tensor(
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device='cpu'
+        )
+        top_ks = torch.tensor(
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device='cpu'
+        )
+        min_ps = torch.tensor(
+            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device='cpu'
+        )
+        sampling_seed = (
+            torch.tensor(
+                [r.sampling_params.sampling_seed for r in reqs],
+                dtype=torch.int32,
+                device='cpu'
+            )
+            if enable_deterministic
+            else None
+        )
+        
+        logit_bias = None
+        if any(r.sampling_params.logit_bias is not None for r in reqs):
+            logit_bias = torch.zeros(len(reqs), vocab_size, device="cpu")
+            for i, r in enumerate(reqs):
+                if r.sampling_params.logit_bias is not None:
+                    for key, value in r.sampling_params.logit_bias.items():
+                        logit_bias[i, int(key)] = value
+
+        merged_custom_logit_processor = None
+        custom_params = None
+        return SamplingBatchInfo(
+			temperatures=temperatures,
+            top_ps=top_ps,
+            top_ks=top_ks,
+            min_ps=min_ps,
+            sampling_seed=sampling_seed,
+            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
+            need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
+            need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
+            need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+            vocab_size=vocab_size,
+            custom_params=custom_params,
+            custom_logit_processor=merged_custom_logit_processor,
+            device='cpu',
+            logit_bias=logit_bias,
+		)
+
+
+@dataclass
+class LogitsKey:
+    logits: torch.Tensor
+    logits_result: torch.Tensor
+
+    def __len__(self) -> int:
+        return len(self.logits)
+    
+    
+
+class TreeNode:
+    counter = 0
+    def __init__(self, id: Optional[int] = None):
+        self.children = defaultdict(TreeNode)
+        self.parent: TreeNode = None
+        self.key: LogitsKey = None
+        self.value: Optional[torch.Tensor] = None
+        self.lock_ref = 0
+        self.last_access_time = time.monotonic()
+        self.creation_time = time.monotonic()
+        self.hit_count = 0
+        # indicating the node is locked to protect from eviction
+        # incremented when the node is referenced by a storage operation
+        self.host_ref_counter = 0
+        # store the host indices of KV cache
+        self.host_value: Optional[torch.Tensor] = None
+        # store hash values of each pages
+        self.hash_value: Optional[List[str]] = None
+
+        self.id = TreeNode.counter if id is None else id
+        TreeNode.counter += 1
+
+    @property
+    def evicted(self):
+        return self.value is None
+
+    @property
+    def backuped(self):
+        return self.host_value is not None
+    
+    @property
+    def is_null(self) -> bool:
+        return (self.key, self.value) == (None, None)
+
+    def protect_host(self):
+        """Protect the host value from eviction."""
+        self.host_ref_counter += 1
+
+    def release_host(self):
+        """Release the host value, allowing it to be evicted."""
+        if self.host_ref_counter > 0:
+            self.host_ref_counter -= 1
+        else:
+            raise RuntimeError("Host reference counter is already zero.")
+
+    def get_last_hash_value(self) -> Optional[str]:
+        """Returns the hash value of the last page in this node."""
+        if self.hash_value is None or len(self.hash_value) == 0:
+            return None
+        return self.hash_value[-1]
+
+    @lru_cache(maxsize=1)
+    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
+        if node is None or node.hash_value is None:
+            return []
+
+        return node.get_prefix_hash_values(node.parent) + node.hash_value
+
+    def __lt__(self, other: "TreeNode"):
+        return self.last_access_time < other.last_access_time
+
+
+
+def _check_extra_key(key0: LogitsKey, key1: LogitsKey):
+    pass
+    # if key0.extra_key != key1.extra_key:
+    #     raise ValueError(
+    #         f"_key_match should be run on the same extra key, but got key0.extra_key={key0.extra_key} != key1.extra_key={key1.extra_key}"
+    #     )
+
+
+def _key_match_page_size1(key0: LogitsKey, key1: LogitsKey):
+    pass
+    # _check_extra_key(key0, key1)
+    # i = 0
+    # for k0, k1 in zip(key0.token_ids, key1.token_ids):
+    #     if k0 != k1:
+    #         break
+    #     i += 1
+    # return i
+
+
+def _key_match_paged(key0: LogitsKey, key1: LogitsKey, page_size: int):
+    _check_extra_key(key0, key1)
+    min_len = min(len(key0), len(key1))
+
+    i = 0
+    while i < min_len:
+        if key0.token_ids[i : i + page_size] != key1.token_ids[i : i + page_size]:
+            break
+        i += page_size
+
+    return i
+
+
+def get_child_key(key: LogitsKey, page_size: int = 1):
+    if page_size == 1:
+        plain_key = key.logits_result[0]
+    else:
+        plain_key = tuple(key.logits_result[:page_size])
+    return plain_key
+
+
+class LogitsCache(BasePrefixCache):
+    def __init__(
+        self,
+        page_size: int,
+        # sample_info: SamplingParams,
+        disable: bool = False,
+        enable_metrics: bool = False,
+        enable_kv_cache_events: bool = False,
+        eviction_policy: str = "lru",
+        is_eagle: bool = False,
+    ):
+        self.page_size = page_size
+        self.disable = disable
+        self.enable_kv_cache_events = enable_kv_cache_events
+        self.kv_event_queue = []
+        self.is_eagle = is_eagle
+
+        if enable_metrics:
+            self.init_metrics_collector()
+
+        self.device = torch.device("cpu")
+        if self.page_size == 1:
+            self.key_match_fn = _key_match_page_size1
+            self.get_child_key_fn = get_child_key
+        else:
+            self.key_match_fn = partial(_key_match_paged, page_size=page_size)
+            self.get_child_key_fn = partial(get_child_key, page_size=page_size)
+
+        if eviction_policy.lower() == "lru":
+            self.eviction_strategy: EvictionStrategy = LRUStrategy()
+        elif eviction_policy.lower() == "lfu":
+            self.eviction_strategy: EvictionStrategy = LFUStrategy()
+        elif eviction_policy.lower() == "fifo":
+            self.eviction_strategy: EvictionStrategy = FIFOStrategy()
+        elif eviction_policy.lower() == "mru":
+            self.eviction_strategy: EvictionStrategy = MRUStrategy()
+        elif eviction_policy.lower() == "filo":
+            self.eviction_strategy: EvictionStrategy = FILOStrategy()
+        else:
+            raise ValueError(
+                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'."
+            )
+        self.reset()
+
+    ##### Public API #####
+
+    def reset(self):
+        self.root_node = TreeNode()
+        self.root_node.key = None
+        self.root_node.value = None
+        self.root_node.host_value = []
+        self.root_node.lock_ref = 1
+        self.evictable_size_ = 0
+        self.protected_size_ = 0
+        self.init_time = time.monotonic() # used to evict request info
+        self._record_all_cleared_event()
+
+    # TODO should we change this to GPU kernel?
+    # currently we don't support custom logits processor
+    def get_sample_result(self):
+        assert not self.root_node.is_null
+        root_key = self.root_node.key
+        for ind in range(root_key.logits.shape[0]):
+            next_token_logits = root_key.logits[ind]
+        
+        
+        
+
+    # def log_sampling_info(self):
+    #     logit_sampling_msg = (
+    #         f"Sampling batch{iter_msg}, "
+    #         f"#new-seq: {len(can_run_list)}, "
+    #         f"#new-token: {adder.log_input_tokens}, "
+    #         f"#cached-token: {adder.log_hit_tokens}, "
+    #         f"{token_usage_msg}"
+    #         f"#running-req: {running_bs}, "
+    #         f"#queue-req: {len(self.waiting_queue)}, "
+    #     )
+
+
+    def insert(self, key: LogitsKey, value=None):
+        if self.disable:
+            return 0
+        if value is None:
+            value = torch.tensor(key.logits_result, dtype=torch.int64)
+        return self._insert_helper(self.root_node, key, value)
+
+    def pretty_print(self):
+        self._print_helper(self.root_node, 0)
+        print(f"#tokens: {self.total_size()}")
+
+    def total_size(self):
+        return self._total_size_helper()
+
+    def evict(self, num_tokens: int):
+        if self.disable:
+            return
+
+        start_time = time.perf_counter()
+        leaves = self._collect_leaves()
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), node) for node in leaves
+        ]
+        heapq.heapify(eviction_heap)
+
+        num_evicted = 0
+        while num_evicted < num_tokens and len(eviction_heap):
+            _priority, x = heapq.heappop(eviction_heap)
+
+            num_evicted += len(x.value)
+            self._delete_leaf(x)
+
+            if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
+                new_priority = self.eviction_strategy.get_priority(x.parent)
+                heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+            self._record_remove_event(x)
+
+        self.update_eviction_metrics(num_evicted, start_time)
+
+    def inc_lock_ref(self, node: TreeNode):
+        if self.disable:
+            return 0
+
+        delta = 0
+        while node != self.root_node:
+            if node.lock_ref == 0:
+                self.evictable_size_ -= len(node.key)
+                self.protected_size_ += len(node.key)
+                delta -= len(node.key)
+            node.lock_ref += 1
+            node = node.parent
+        return delta
+
+    def dec_lock_ref(self, node: TreeNode):
+        if self.disable:
+            return 0
+
+        delta = 0
+        while node != self.root_node:
+            if node.lock_ref == 1:
+                self.evictable_size_ += len(node.key)
+                self.protected_size_ -= len(node.key)
+                delta += len(node.key)
+            node.lock_ref -= 1
+            if node.parent is None:
+                assert (
+                    node is self.root_node
+                ), "This request holds the node from another tree"
+            node = node.parent
+        return delta
+
+    def evictable_size(self):
+        return self.evictable_size_
+
+    def protected_size(self):
+        # protected size refers to the size of the cache that is locked
+        return self.protected_size_
+
+    def all_values_flatten(self):
+        values = []
+
+        def _dfs_helper(node: TreeNode):
+            for _, child in node.children.items():
+                values.append(child.value)
+                _dfs_helper(child)
+
+        _dfs_helper(self.root_node)
+        return torch.cat(values)
+
+    ##### Internal Helper Functions #####
+
+    def _match_prefix_helper(self, node: TreeNode, key: LogitsKey):
+        access_time = time.monotonic()
+        node.last_access_time = access_time
+
+        child_key = self.get_child_key_fn(key)
+
+        value = []
+        while len(key) > 0 and child_key in node.children.keys():
+            child = node.children[child_key]
+            child.last_access_time = access_time
+            prefix_len = self.key_match_fn(child.key, key)
+            if prefix_len < len(child.key):
+                new_node = self._split_node(child.key, child, prefix_len)
+                value.append(new_node.value)
+                node = new_node
+                break
+            else:
+                value.append(child.value)
+                node = child
+                key = key[prefix_len:]
+
+                if len(key):
+                    child_key = self.get_child_key_fn(key)
+
+        return value, node
+
+    def _split_node(self, key: LogitsKey, child: TreeNode, split_len: int):
+        # new_node -> child
+        self._record_remove_event(child)
+        new_node = TreeNode()
+        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
+        new_node.parent = child.parent
+        new_node.lock_ref = child.lock_ref
+        new_node.key = child.key[:split_len]
+        new_node.value = child.value[:split_len]
+        child.parent = new_node
+        child.key = child.key[split_len:]
+        child.value = child.value[split_len:]
+        new_node.parent.children[self.get_child_key_fn(key)] = new_node
+
+        self._record_store_event(new_node)
+        self._record_store_event(child)
+
+        return new_node
+
+    def _insert_helper(self, node: TreeNode, key: LogitsKey, value: torch.Tensor):
+        access_time = time.monotonic()
+        node.last_access_time = access_time
+        if len(key) == 0:
+            return 0
+
+        child_key = self.get_child_key_fn(key)
+        # first init root node is null
+        if node.is_null:
+            node.key = key
+            node.value = value
+            node.lock_ref += 1
+            self.evictable_size_ += len(key)
+            return 0
+
+        total_prefix_length = 0
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = access_time
+            prefix_len = self.key_match_fn(node.key, key)
+            total_prefix_length += prefix_len
+            key = key[prefix_len:]
+            value = value[prefix_len:]
+
+            if prefix_len < len(node.key):
+                new_node = self._split_node(node.key, node, prefix_len)
+                node = new_node
+
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+
+        if len(key):
+            new_node = TreeNode()
+            new_node.parent = node
+            new_node.key = key
+            new_node.value = value
+            node.children[child_key] = new_node
+            self.evictable_size_ += len(key)
+            self._record_store_event(new_node)
+        return total_prefix_length
+
+    def _print_helper(self, node: TreeNode, indent: int):
+        """Prints the radix tree in a human-readable format."""
+        stack = [(node, indent)]
+        while stack:
+            current_node, current_indent = stack.pop()
+            print(
+                " " * current_indent,
+                len(current_node.key),
+                current_node.key.token_ids[:10],
+                f"r={current_node.lock_ref}",
+            )
+            for key, child in current_node.children.items():
+                stack.append((child, current_indent + 2))
+
+                assert key == self.get_child_key_fn(
+                    child.key
+                ), f"{key=}, {self.get_child_key_fn(child.key)=}"
+
+    def _delete_leaf(self, node):
+        pass
+        # for k, v in node.parent.children.items():
+        #     if v == node:
+        #         break
+        # del node.parent.children[k]
+        # self.evictable_size_ -= len(node.key)
+
+    def _total_size_helper(self):
+        total_size = 0
+        stack = [self.root_node]
+        while stack:
+            current_node = stack.pop()
+            total_size += len(current_node.value)
+            for child in current_node.children.values():
+                if child.evicted:
+                    continue
+                stack.append(child)
+        return total_size
+
+    def _collect_leaves(self):
+        ret_list = []
+        stack = list(self.root_node.children.values())
+
+        while stack:
+            cur_node = stack.pop()
+            if len(cur_node.children) == 0:
+                if cur_node.lock_ref == 0:
+                    ret_list.append(cur_node)
+            else:
+                stack.extend(cur_node.children.values())
+
+        return ret_list
+
+    def _record_store_event(self, node: TreeNode):
+        return
+        # One BlockStored per ``page_size`` chunk.
+        if self.enable_kv_cache_events:
+            # First chunk links to the last page of the parent node (if any).
+            if node.parent is None or node != self.root_node:
+                parent_block_hash = None
+            else:
+                last_page_start = (
+                    (len(node.parent.key) - 1) // self.page_size
+                ) * self.page_size
+                parent_parent_tokens = node.parent.key.token_ids[last_page_start:]
+                parent_block_hash = hash(tuple(parent_parent_tokens))
+
+            for start in range(0, len(node.key), self.page_size):
+                page_tokens = node.key.token_ids[start : start + self.page_size]
+                if not page_tokens:
+                    continue
+
+                block_hash = hash(tuple(page_tokens))
+
+                self.kv_event_queue.append(
+                    BlockStored(
+                        block_hashes=[block_hash],
+                        parent_block_hash=parent_block_hash,
+                        token_ids=page_tokens,
+                        block_size=len(page_tokens),
+                        lora_id=None,
+                    )
+                )
+
+                # Chain next chunk to this one.
+                parent_block_hash = block_hash
+
+    def _record_remove_event(self, node: TreeNode):
+        # One BlockRemoved per chunk.
+        if self.enable_kv_cache_events:
+            for start in range(0, len(node.key), self.page_size):
+                page_tokens = node.key.token_ids[start : start + self.page_size]
+                if not page_tokens:
+                    continue
+                block_hash = hash(tuple(page_tokens))
+                self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+
+    def _record_all_cleared_event(self):
+        if self.enable_kv_cache_events:
+            self.kv_event_queue.append(AllBlocksCleared())
+
+    def take_events(self):
+        """Atomically takes all events and clears the queue.
+
+        Returns:
+            A list of KV cache events.
+        """
+        if not self.enable_kv_cache_events:
+            return []
+        events = self.kv_event_queue
+        self.kv_event_queue = []
+        return events
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
+        pass
+
+    def cache_unfinished_req(self, req: Req, **kwargs):
+        pass
+
+    def match_prefix(self, key: LogitsKey, **kwargs) -> MatchResult:
+        pass
+
+
+if __name__ == "__main__":
+    tree = LogitsCache(page_size=1, disable=False)
+
+    # Example token id sequences (as lists of ints)
+    tree.insert("123", LogitsKey(logits=[1, 2, 3], logits_result=0))
+    tree.insert("123", LogitsKey(logits=[1, 2, 3], logits_result=1))
+    tree.insert("123", LogitsKey(logits=[1, 2, 4, 5], logits_result=1))
+    tree.insert("123", LogitsKey(logits=[1, 2, 4, 5, 6, 7], logits_result=1))
+    tree.insert("123", LogitsKey(logits=[8, 9, 10, 11, 12], logits_result=1))
+    tree.pretty_print()
+
+    # print(tree.match_prefix(LogitsKey(token_ids=[1, 2, 3, 13, 14], extra_key=None)))

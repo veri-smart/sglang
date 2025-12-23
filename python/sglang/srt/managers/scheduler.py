@@ -34,7 +34,7 @@ import zmq
 from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
-
+from sglang.srt.mem_cache.logits_cache import LogitsRecord
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
@@ -193,7 +193,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -426,8 +426,10 @@ class Scheduler(
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
-        # Init cache using the existing memory pool
-        self.init_cache_with_memory_pool()
+        # Init memory pool and cache
+        self.init_memory_pool_and_cache()
+        
+        self.logits_recorder = LogitsRecord(self.req_to_token_pool, server_args)
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -809,6 +811,18 @@ class Scheduler(
                 )
             )
         )
+        
+        if server_args.enable_logits_cache:
+            # TODO
+            from sglang.srt.mem_cache.logits_cache import LogitsCache
+            self.logits_cache = LogitsCache(
+                page_size=self.page_size,
+                disable=server_args.disable_radix_cache,
+                enable_metrics=self.enable_metrics,
+                enable_kv_cache_events=self.enable_kv_cache_events,
+                eviction_policy=server_args.radix_eviction_policy,
+                is_eagle=self.spec_algorithm.is_eagle(),
+			)
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
@@ -1038,6 +1052,7 @@ class Scheduler(
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+                self.logits_recorder.record_batch(batch, batch_result)
 
             if self.last_batch:
                 if not disable_overlap_for_batch and not need_grammar_sync:
@@ -1319,6 +1334,7 @@ class Scheduler(
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
+                logits_cached=recv_req.logits_cached
             )
             req.tokenizer = self.tokenizer
 
@@ -1776,6 +1792,7 @@ class Scheduler(
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
+        cached_decode_batch = []
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
 
@@ -1807,7 +1824,12 @@ class Scheduler(
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
-
+            
+            if self.logits_recorder.enable_logits_cache:
+                match_result = self.logits_recorder.get_logits_cache(req)
+                if match_result:
+                    cached_decode_batch.append(req)
+                    continue
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
@@ -1825,6 +1847,22 @@ class Scheduler(
                     else:
                         self.running_batch.batch_is_full = True
                 break
+
+        # update decode batch
+        if len(cached_decode_batch) > 0:
+            decode_batch = ScheduleBatch.init_new(
+               cached_decode_batch,
+               self.req_to_token_pool,
+               self.token_to_kv_pool_allocator,
+               self.tree_cache,
+               self.model_config,
+               self.enable_overlap,
+               self.spec_algorithm,
+               chunked_req=self.chunked_req,
+            )
+            decode_batch.prepare_for_cached_decode()
+            return decode_batch
+
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list

@@ -22,7 +22,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
-
+from sglang.srt.mem_cache.logits_cache import LogitsKey
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         EmbeddingBatchResult,
@@ -367,8 +367,13 @@ class SchedulerOutputProcessorMixin:
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         release_kv_cache(req, self.tree_cache)
                 else:
+                    if self.logits_recorder.enable_logits_cache:
+                      history_logits, _ = self.logits_recorder.summary(req.rid)
+                      self.logits_recorder.update_req(req, history_logits)
                     release_kv_cache(req, self.tree_cache)
-
+                # Once the request is finished, we should add the whole decode token to logits cache
+                # if self.enable_logits_cache:
+                #     self.logits_cache.insert(req.rid, LogitsKey())
                 req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():

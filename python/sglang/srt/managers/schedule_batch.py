@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.mem_cache.logits_cache import LogitsRecord
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 # Copyright 2023-2024 SGLang Team
@@ -486,6 +487,7 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        logits_cached :bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -708,6 +710,9 @@ class Req:
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
+        
+        # For Logits Cache
+        self.logits_cached = logits_cached
 
         # For diffusion LLM
         self.dllm_ids = []
@@ -1783,6 +1788,173 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+    def prepare_for_cached_decode(self):
+        """
+        this function is used to prepare logits cached requests 
+        """
+        self.forward_mode = ForwardMode.DECODE
+
+        reqs = self.reqs
+        input_ids = [r.fill_ids[-1:] for r in reqs]
+        extend_num_tokens = len(reqs)
+        seq_lens = [len(r.fill_ids) for r in reqs]
+        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
+        prefix_lens = [len(r.prefix_indices) for r in reqs]
+        extend_lens = [r.extend_input_len for r in reqs]
+
+        token_type_ids = [
+            r.token_type_ids for r in reqs if r.token_type_ids is not None
+        ]
+
+        input_ids_tensor = torch.tensor(
+            list(chain.from_iterable(input_ids)), dtype=torch.int64
+        ).to(self.device, non_blocking=True)
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        orig_seq_lens_tensor = torch.tensor(orig_seq_lens, dtype=torch.int32).to(
+            self.device, non_blocking=True
+        )
+
+        token_type_ids_tensor = None
+        if len(token_type_ids) > 0:
+            token_type_ids_tensor = torch.tensor(
+                sum(token_type_ids, []), dtype=torch.int64
+            ).to(self.device, non_blocking=True)
+
+        # Set batch fields needed by alloc_for_extend
+        self.prefix_lens = prefix_lens
+        self.extend_lens = extend_lens
+        self.seq_lens = seq_lens_tensor
+        self.seq_lens_cpu = seq_lens_cpu
+        self.extend_num_tokens = extend_num_tokens
+
+        # Allocate memory
+        out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
+            self
+        )
+
+        # Set fields
+        extend_input_logprob_token_ids = []
+
+        for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
+            req.req_pool_idx = req_pool_indices[i]
+            assert seq_len - pre_len == req.extend_input_len
+
+            # update req-level memory management fields
+            req.kv_committed_len = seq_len
+            req.kv_allocated_len = seq_len
+
+
+            req.cached_tokens += pre_len - req.already_computed
+            req.already_computed = seq_len
+            req.is_retracted = False
+
+            # Compute the relative logprob_start_len in an extend batch
+            #
+            # Key variables:
+            # - logprob_start_len: Absolute position in full sequence where logprob computation begins
+            # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
+            # - extend_input_len: Number of tokens that need to be processed in this extend batch
+            #   (= len(fill_ids) - len(prefix_indices), where fill_ids = origin_input_ids + output_ids
+            #    and prefix_indices are the cached/shared prefix tokens)
+            #
+            if req.logprob_start_len >= pre_len:
+                # Optimization for prefill-only requests: When we only need logprobs at
+                # positions beyond the input sequence (to score next-token likelihood), skip all
+                # input logprob computation during prefill since no generation will occur.
+                if self.is_prefill_only and req.logprob_start_len == len(
+                    req.origin_input_ids
+                ):
+                    # Skip ALL input logprobs: set extend_logprob_start_len = extend_input_len
+                    req.extend_logprob_start_len = req.extend_input_len
+                else:
+                    # Convert absolute logprob_start_len to relative extend_logprob_start_len
+                    #
+                    # Example: origin_input_ids=[1,2,3,4,5] (5 tokens, positions 0-4), logprob_start_len=3
+                    # Regular logic: min(3-0, 5, 5-1) = min(3,5,4) = 3
+                    # This means: "compute logprobs from position 3 onwards in extend batch"
+                    req.extend_logprob_start_len = min(
+                        req.logprob_start_len - pre_len,
+                        req.extend_input_len,
+                        req.seqlen - 1,
+                    )
+            else:
+                # logprob_start_len is before the current extend batch, so start from beginning
+                req.extend_logprob_start_len = 0
+
+            if self.return_logprob:
+                # Find input logprob token ids.
+                # First, find a global index within origin_input_ids and slide it by 1
+                # to compute input logprobs. It is because you need the next token
+                # to compute input logprobs. E.g., (chunk size 2)
+                #
+                # input_logprobs = [1, 2, 3, 4]
+                # fill_ids = [1, 2]
+                # extend_input_logprob_token_id = [2, 3]
+                #
+                # Note that it can also overflow. In this case, we pad it with 0.
+                # input_logprobs = [1, 2, 3, 4]
+                # fill_ids = [3, 4]
+                # extend_input_logprob_token_id = [4, 0]
+                global_start_idx, global_end_idx = (
+                    len(req.prefix_indices),
+                    len(req.fill_ids),
+                )
+                # Apply logprob_start_len
+                if global_start_idx < req.logprob_start_len:
+                    global_start_idx = req.logprob_start_len
+
+                logprob_token_ids = req.origin_input_ids[
+                    global_start_idx + 1 : global_end_idx + 1
+                ]
+                extend_input_logprob_token_ids.extend(logprob_token_ids)
+
+                # We will need req.extend_input_len - req.extend_logprob_start_len number of
+                # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
+                extend_input_logprob_token_ids.extend(
+                    [0]
+                    * (
+                        req.extend_input_len
+                        - req.extend_logprob_start_len
+                        - len(logprob_token_ids)
+                    )
+                )
+
+        if self.return_logprob:
+            extend_input_logprob_token_ids = torch.tensor(
+                extend_input_logprob_token_ids
+            )
+        else:
+            extend_input_logprob_token_ids = None
+
+        self.input_ids = input_ids_tensor
+        self.req_pool_indices = req_pool_indices_tensor
+        self.orig_seq_lens = orig_seq_lens_tensor
+        self.out_cache_loc = out_cache_loc
+
+        self.token_type_ids = token_type_ids_tensor
+        self.seq_lens_sum = sum(seq_lens)
+
+        if self.return_logprob:
+            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+            self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
+
+        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+
+        if self.model_config.is_encoder_decoder:
+            self.prepare_encoder_info_extend(input_ids, seq_lens)
+
+        # Build sampling info
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
+        
+
 
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:

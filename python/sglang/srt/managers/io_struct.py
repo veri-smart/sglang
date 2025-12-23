@@ -40,6 +40,7 @@ else:
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
     http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
+    logits_cached :Union[bool, List[bool]] = field(default=None, kw_only=True)
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -330,8 +331,11 @@ class GenerateReqInput(BaseReq):
         """Normalize inputs for a single example."""
         if self.sampling_params is None:
             self.sampling_params = {}
+        if self.rid is not None:
+            self.logits_cached = True
         if self.rid is None:
             self.rid = uuid.uuid4().hex
+            self.logits_cached = False
         if self.return_logprob is None:
             self.return_logprob = False
         if self.logprob_start_len is None:
