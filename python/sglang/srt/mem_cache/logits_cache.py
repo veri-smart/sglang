@@ -214,6 +214,7 @@ class LogitsRecord:
         req.prefix_indices = self.req_kv_ind[req.rid].input_tok
         req.req_kv_indices = self.req_kv_ind[req.rid].all_tok
         req.extend_input_len = 1 # set this to 1
+        req.cache_protected_len = len(req.fill_ids) - 1
         
         self.req_already_loaded.add(req.rid)
         return True
