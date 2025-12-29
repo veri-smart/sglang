@@ -388,6 +388,72 @@ def alloc_for_extend(
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
+def alloc_for_cached_decode(
+    batch: ScheduleBatch,
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    # free out-of-window swa tokens
+    if isinstance(batch.tree_cache, SWAChunkCache):
+        raise RuntimeError("currently not support")
+        # for req, pre_len in zip(batch.reqs, batch.prefix_lens):
+        #     batch.tree_cache.evict_swa(
+        #         req, pre_len, batch.model_config.attention_chunk_size
+        #     )
+
+    bs = len(batch.reqs)
+    req_kv_tensors = [r.req_kv_indices for r in batch.reqs]
+
+    # Create tensors for allocation
+    prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
+    req_kv_lens_cpu = torch.tensor(batch.req_kv_lens, dtype=torch.int64)
+    extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
+    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
+    req_kv_lens_device = req_kv_lens_cpu.to(batch.device, non_blocking=True)
+    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+
+    # Allocate req slots
+    req_pool_indices = alloc_req_slots(
+        batch.req_to_token_pool, bs, batch.reqs, batch.tree_cache
+    )
+    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+
+    # Allocate KV cache (throws exception on failure)
+    if batch.tree_cache.page_size == 1:
+        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+    else:
+        # Paged allocation - build last_loc
+        last_loc = [
+            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+            for t in req_kv_tensors
+        ]
+        out_cache_loc = alloc_paged_token_slots_extend(
+            tree_cache=batch.tree_cache,
+            prefix_lens=extend_lens_device,
+            prefix_lens_cpu=extend_lens_cpu,
+            seq_lens=batch.seq_lens,
+            seq_lens_cpu=batch.seq_lens_cpu,
+            last_loc=torch.cat(last_loc),
+            extend_num_tokens=batch.extend_num_tokens,
+        )
+
+
+    # Write to req_to_token_pool
+    write_cache_indices(
+        out_cache_loc,
+        req_pool_indices_device,
+        req_pool_indices_cpu,
+        req_kv_lens_device,
+        req_kv_lens_cpu,
+        batch.seq_lens,
+        batch.seq_lens_cpu,
+        extend_lens_device,
+        extend_lens_cpu,
+        req_kv_tensors,
+        batch.req_to_token_pool,
+    )
+
+    return out_cache_loc, req_pool_indices_device, req_pool_indices
+
 
 def alloc_paged_token_slots_decode(
     tree_cache: BasePrefixCache,
@@ -463,8 +529,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    tree_cache.cache_finished_req(req, is_insert=is_insert)
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True, is_complete: bool = False):
+    tree_cache.cache_finished_req(req, is_insert=is_insert, is_complete=is_complete)
     start_p, end_p = req.pop_overallocated_kv_cache()
 
     global_server_args = get_global_server_args()

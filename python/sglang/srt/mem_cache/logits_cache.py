@@ -3,8 +3,10 @@ import heapq
 import time
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from collections import defaultdict
-from functools import lru_cache, partial
-from typing import TYPE_CHECKING, List, Optional, Tuple, Dict
+from functools import lru_cache, partial, cached_property
+from typing import TYPE_CHECKING, List, Optional, Tuple, Dict, Set
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from dataclasses import dataclass, field
 import torch
 from sglang.srt.disaggregation.kv_events import (
@@ -38,12 +40,17 @@ class Recorder:
     @staticmethod
     def _to_tensor(data: List | torch.Tensor) -> torch.Tensor:
         return torch.tensor(data, dtype=torch.int32) if isinstance(data, List) else data
-
+    
     @property
     def all_tok(self) -> torch.Tensor:
         self._input = self._to_tensor(self._input)
         self._output = self._to_tensor(self._output)
         return torch.cat([self._input, self._output], dim=0)
+
+    @property
+    def input_tok(self) -> torch.Tensor:
+        return self._to_tensor(self._input)
+        
 
 @dataclass
 class LogitsRecord:
@@ -55,6 +62,8 @@ class LogitsRecord:
     req_tok: Dict[str, Recorder] | None = None    # record the req's token
     _sampler: Optional[object] = field(default=None, repr=False)
     model_config: Optional[ModelConfig] = field(default=None, repr=False)
+    req_already_loaded: Set[str] | None = None    # mark a request's logits kv cache is already loaded 
+    
 
     def __post_init__(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -63,6 +72,7 @@ class LogitsRecord:
             self.logits_cache = {}
             self.req_kv_ind = {}
             self.req_tok = {}
+            self.req_already_loaded = set()
 
     @property
     def sampler(self):
@@ -71,7 +81,7 @@ class LogitsRecord:
             self._sampler = Sampler()
         return self._sampler
 
-    @property
+    @cached_property
     def enable_logits_cache(self) -> bool:
         return self.req_logits_key is not None
 
@@ -83,6 +93,10 @@ class LogitsRecord:
         for ind, req in enumerate(batch.reqs):
             if req.rid in self.req_logits_key:
                 self.req_logits_key[req.rid].append(LogitsKey(logits[ind], logits_results[ind]))
+                continue
+            if  batch.forward_mode.is_decode():
+                # forget cached request
+                self.req_logits_key[req.rid] = [LogitsKey(logits[ind], logits_results[ind])]
                 continue
             # if batch.forward_mode.is_decode():
             #   committed_kv_len = req.kv_committed_len
@@ -127,19 +141,25 @@ class LogitsRecord:
         # clear request info
         self.req_logits_key.pop(req.rid)
 
-    def get_logits_cache(self, req: Req) -> bool:
+    def get_logits_cache(self, req: Req, tree_cache: Optional[BasePrefixCache] = None) -> bool:
         if self.enable_logits_cache is False:
             return False
         if req.rid not in self.logits_cache:
             return False
-        
+        if req.rid in self.req_already_loaded:
+            return False
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         node = self.logits_cache[req.rid].root_node
         sampling_batch_info = self.generate_sampling_info([req])
         req_tok = self.req_tok[req.rid]
+        
+        logits = node.key.logits
+        logits_res = node.key.logits_result
+        assert (logits.shape[0] == len(logits_res) + 1)
+        output_tok = []
         for i in range(len(node.key.logits_result)):
-            cur_logit = LogitsProcessorOutput(next_token_logits=node.key.logits[i:i+1])
-            cur_logit_res = node.key.logits_result[i]
+            cur_logit = LogitsProcessorOutput(next_token_logits=logits[i:i+1])
+            cur_logit_res = logits_res[i]
             
             nxt_id = self.sampler(
                 logits_output=cur_logit, 
@@ -153,13 +173,49 @@ class LogitsRecord:
                 # TODO split the tree
                 ...
             print(nxt_id)
-            req.output_ids.append(cur_logit_res)
-            # req.
+            output_tok.append(cur_logit_res)
+
+        nxt_id = self.sampler(
+                logits_output=LogitsProcessorOutput(next_token_logits=logits[-1:]), 
+                sampling_info=sampling_batch_info,
+                return_logprob=False,
+                top_logprobs_nums=[],
+                token_ids_logprobs=[],
+                positions=req.seqlen,
+                )
+        output_tok.append(nxt_id.item())
+        
+        # Here we should first check if kv cache is still stored at radix tree
+        if tree_cache is not None:
+            token_ids = req_tok.input_tok.tolist() + output_tok[:-1]
+            match_result = tree_cache.match_prefix(
+                key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+                **(
+                    {"req": self, "cow_mamba": True}
+                    if isinstance(tree_cache, MambaRadixCache)
+                    else {}
+                ),
+            )
+            (
+                req.last_node,
+                req.last_host_node,
+                req.host_hit_length,
+            ) = (
+                match_result.last_device_node,
+                match_result.last_host_node,
+                match_result.host_hit_length,
+            )
+        
+        
         # update request info
-        req.fill_ids = req_tok.all_tok
-        req.origin_input_ids = req_tok.all_tok
-        req.prefix_indices = self.req_kv_ind[req.rid].all_tok
+        req.fill_ids = req_tok.input_tok.tolist() + output_tok
+        req.output_ids = output_tok
+        req.origin_input_ids = req_tok.input_tok.tolist()
+        req.prefix_indices = self.req_kv_ind[req.rid].input_tok
+        req.req_kv_indices = self.req_kv_ind[req.rid].all_tok
         req.extend_input_len = 1 # set this to 1
+        
+        self.req_already_loaded.add(req.rid)
         return True
 
         # logits_output = LogitsProcessorOutput(next_token_logits=sampled_logits)

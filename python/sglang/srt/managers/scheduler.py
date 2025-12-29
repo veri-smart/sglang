@@ -427,7 +427,7 @@ class Scheduler(
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
         # Init memory pool and cache
-        self.init_memory_pool_and_cache()
+        self.init_cache_with_memory_pool()
         
         self.logits_recorder = LogitsRecord(self.req_to_token_pool, server_args)
 
@@ -1015,8 +1015,9 @@ class Scheduler(
 
         def pop_and_process():
             # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            if self.result_queue:
+              tmp_batch, tmp_result = self.result_queue.popleft()
+              self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             recv_reqs = self.recv_requests()
@@ -1826,7 +1827,7 @@ class Scheduler(
                     continue
             
             if self.logits_recorder.enable_logits_cache:
-                match_result = self.logits_recorder.get_logits_cache(req)
+                match_result = self.logits_recorder.get_logits_cache(req, self.tree_cache)
                 if match_result:
                     cached_decode_batch.append(req)
                     continue
@@ -1861,6 +1862,10 @@ class Scheduler(
                chunked_req=self.chunked_req,
             )
             decode_batch.prepare_for_cached_decode()
+            self.waiting_queue = [x for x in self.waiting_queue if x not in cached_decode_batch]
+            if self.last_batch is None:
+                # preserve safety
+                self.last_batch = decode_batch
             return decode_batch
 
 

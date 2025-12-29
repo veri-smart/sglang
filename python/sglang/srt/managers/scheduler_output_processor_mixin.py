@@ -370,7 +370,7 @@ class SchedulerOutputProcessorMixin:
                     if self.logits_recorder.enable_logits_cache:
                       history_logits, _ = self.logits_recorder.summary(req.rid)
                       self.logits_recorder.update_req(req, history_logits)
-                    release_kv_cache(req, self.tree_cache)
+                    release_kv_cache(req, self.tree_cache, is_complete=self.logits_recorder.enable_logits_cache)
                 # Once the request is finished, we should add the whole decode token to logits cache
                 # if self.enable_logits_cache:
                 #     self.logits_cache.insert(req.rid, LogitsKey())

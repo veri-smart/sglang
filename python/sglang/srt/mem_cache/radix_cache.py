@@ -426,7 +426,7 @@ class RadixCache(BasePrefixCache):
         page_aligned_len = len(key) // self.page_size * self.page_size
         return key[:page_aligned_len]
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(self, req: Req, is_insert: bool = True, is_complete: bool = False):
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
@@ -447,7 +447,12 @@ class RadixCache(BasePrefixCache):
         ]
 
         # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
+        # if 'is_complete' is set, indicates we enable whole request cache for logits cache 
+        if is_complete:
+            keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
+        else:
+            keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
+
         keys = self._page_align_keys(keys)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
