@@ -4,7 +4,7 @@ import time
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from collections import defaultdict
 from functools import lru_cache, partial, cached_property
-from typing import TYPE_CHECKING, List, Optional, Tuple, Dict, Set
+from typing import TYPE_CHECKING, List, Optional, Tuple, Dict, Set, Iterator, Union, Callable
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from dataclasses import dataclass, field
@@ -30,27 +30,28 @@ from sglang.srt.configs.model_config import ModelConfig
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 
 @dataclass
 class Recorder:
-    _input: torch.Tensor = field(default_factory=lambda: torch.tensor([], dtype=torch.int32))
-    _output: torch.Tensor = field(default_factory=lambda: torch.tensor([], dtype=torch.int32))
+    _input_tok: torch.Tensor = field(
+        default_factory=lambda: torch.tensor([], dtype=torch.int32))
+    _input_kv: torch.Tensor = field(
+        default_factory=lambda: torch.tensor([], dtype=torch.int32))
 
     @staticmethod
     def _to_tensor(data: List | torch.Tensor) -> torch.Tensor:
         return torch.tensor(data, dtype=torch.int32) if isinstance(data, List) else data
-    
+
     @property
-    def all_tok(self) -> torch.Tensor:
-        self._input = self._to_tensor(self._input)
-        self._output = self._to_tensor(self._output)
-        return torch.cat([self._input, self._output], dim=0)
+    def input_kv(self) -> torch.Tensor:
+        return self._to_tensor(self._input_kv)
 
     @property
     def input_tok(self) -> torch.Tensor:
-        return self._to_tensor(self._input)
-        
+        return self._to_tensor(self._input_tok)
+
 
 @dataclass
 class LogitsRecord:
@@ -58,20 +59,20 @@ class LogitsRecord:
     server_args: ServerArgs
     req_logits_key: Dict[str, List[LogitsKey]] | None = None
     logits_cache: Dict[str, LogitsCache] | None = None
-    req_kv_ind: Dict[str, Recorder] | None = None # record the req's kv indices
-    req_tok: Dict[str, Recorder] | None = None    # record the req's token
+    # record the req's kv indices
+    # record the req's input token and kv
+    req_info: Dict[str, Recorder] | None = None
     _sampler: Optional[object] = field(default=None, repr=False)
     model_config: Optional[ModelConfig] = field(default=None, repr=False)
-    req_already_loaded: Set[str] | None = None    # mark a request's logits kv cache is already loaded 
-    
+    # mark a request's logits kv cache is already loaded
+    req_already_loaded: Set[str] | None = None
 
     def __post_init__(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
         if self.server_args.enable_logits_cache:
             self.req_logits_key = {}
             self.logits_cache = {}
-            self.req_kv_ind = {}
-            self.req_tok = {}
+            self.req_info = {}
             self.req_already_loaded = set()
 
     @property
@@ -85,6 +86,29 @@ class LogitsRecord:
     def enable_logits_cache(self) -> bool:
         return self.req_logits_key is not None
 
+    def sample_child(self, sampling_info: SamplingBatchInfo, seq_len, logits: Union[torch.Tensor, LogitsProcessorOutput]) -> int:
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        if isinstance(logits, torch.Tensor):
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+            elif logits.dim() >= 2:
+                if logits.shape[0] != 1:
+                    logits = logits[-1:].contiguous()
+
+            cur_logit = LogitsProcessorOutput(next_token_logits=logits)
+        else:
+            cur_logit = logits
+        nxt_id = self.sampler(
+            logits_output=cur_logit,
+            sampling_info=sampling_info,
+            return_logprob=False,
+            top_logprobs_nums=[],
+            token_ids_logprobs=[],
+            positions=seq_len,
+            is_cpu=True,
+        )
+        return nxt_id
+
     def record_batch(self, batch: ScheduleBatch, logits_info: GenerationBatchResult):
         if self.enable_logits_cache is False:
             return
@@ -92,26 +116,23 @@ class LogitsRecord:
         logits_results = logits_info.next_token_ids
         for ind, req in enumerate(batch.reqs):
             if req.rid in self.req_logits_key:
-                self.req_logits_key[req.rid].append(LogitsKey(logits[ind], logits_results[ind]))
+                self.req_logits_key[req.rid].append(
+                    LogitsKey(logits[ind], logits_results[ind]))
                 continue
-            if  batch.forward_mode.is_decode():
+            if batch.forward_mode.is_decode():
                 # forget cached request
-                self.req_logits_key[req.rid] = [LogitsKey(logits[ind], logits_results[ind])]
+                self.req_logits_key[req.rid] = [
+                    LogitsKey(logits[ind], logits_results[ind])]
                 continue
-            # if batch.forward_mode.is_decode():
-            #   committed_kv_len = req.kv_committed_len
-            #   ins_kv_indices = []
-            #   out_kv_indices = self.req_to_token_pool.req_to_token[
-            #   req.req_pool_idx, len(req.origin_input_ids):committed_kv_len
-            #   ]
-            assert batch.forward_mode.is_extend(), "encounter strange mode"
-            start_ind = sum(batch.extend_lens[:ind])
-            ins_kv_indices = batch.out_cache_loc[start_ind : batch.extend_lens[ind]]
 
-            self.req_logits_key[req.rid] = [LogitsKey(logits[ind], logits_results[ind])]
-            self.req_kv_ind[req.rid] = Recorder(ins_kv_indices, [])
-            self.req_tok[req.rid] = Recorder(req.origin_input_ids, [])
-            self.logits_cache[req.rid] = LogitsCache(page_size=1, disable=False)
+            assert batch.forward_mode.is_extend(), "encounter strange mode"
+            ins_kv_indices = batch.req_to_token_pool.req_to_token[req.req_pool_idx][: len(req.fill_ids)]
+            self.req_logits_key[req.rid] = [
+                LogitsKey(logits[ind], logits_results[ind])]
+            self.req_info[req.rid] = Recorder(
+                req.origin_input_ids, ins_kv_indices)
+            self.logits_cache[req.rid] = LogitsCache(
+                page_size=1, disable=False)
 
     def summary(self, rid: str) -> Optional[Tuple[torch.Tensor, List[int]]]:
         if self.enable_logits_cache is False:
@@ -120,26 +141,29 @@ class LogitsRecord:
         logits_seq = self.req_logits_key[rid]
         history_logits = torch.stack([key.logits for key in logits_seq], dim=0)
         token_ids = [
-            key.logits_result.item() if isinstance(key.logits_result, torch.Tensor) else key.logits_result
+            key.logits_result.item() if isinstance(
+                key.logits_result, torch.Tensor) else key.logits_result
             for key in logits_seq
         ]
         return history_logits, token_ids
-        
+
     def update_req(self, req: Req, history_logits: torch.Tensor):
         if self.enable_logits_cache is False:
             return
         committed_kv_len = req.kv_committed_len
-        logits_token_ids = req.output_ids[:committed_kv_len - len(req.origin_input_ids)]
+        logits_token_ids = req.output_ids[:committed_kv_len -
+                                          len(req.origin_input_ids)]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, len(req.origin_input_ids):committed_kv_len
         ]
-        self.req_kv_ind[req.rid]._output = kv_indices
-        self.req_tok[req.rid]._output = req.output_ids
         cache_tree = self.logits_cache[req.rid]
-        cache_tree.insert(LogitsKey(history_logits, logits_token_ids))
-        cache_tree.init_time = time.monotonic() # update timing
+        cache_tree.insert(
+            LogitsKey(history_logits, logits_token_ids), kv_indice=kv_indices)
+        cache_tree.init_time = time.monotonic()  # update timing
         # clear request info
         self.req_logits_key.pop(req.rid)
+        if req.rid in self.req_already_loaded:
+            self.req_already_loaded.remove(req.rid)
 
     def get_logits_cache(self, req: Req, tree_cache: Optional[BasePrefixCache] = None) -> bool:
         if self.enable_logits_cache is False:
@@ -149,45 +173,18 @@ class LogitsRecord:
         if req.rid in self.req_already_loaded:
             return False
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        lo_cache = self.logits_cache[req.rid]
         node = self.logits_cache[req.rid].root_node
         sampling_batch_info = self.generate_sampling_info([req])
-        req_tok = self.req_tok[req.rid]
-        
-        logits = node.key.logits
-        logits_res = node.key.logits_result
-        assert (logits.shape[0] == len(logits_res) + 1)
-        output_tok = []
-        for i in range(len(node.key.logits_result)):
-            cur_logit = LogitsProcessorOutput(next_token_logits=logits[i:i+1])
-            cur_logit_res = logits_res[i]
-            
-            nxt_id = self.sampler(
-                logits_output=cur_logit, 
-                sampling_info=sampling_batch_info,
-                return_logprob=False,
-                top_logprobs_nums=[],
-                token_ids_logprobs=[],
-                positions=req.seqlen,
-                )
-            if cur_logit_res != nxt_id:
-                # TODO split the tree
-                ...
-            print(nxt_id)
-            output_tok.append(cur_logit_res)
+        req_info = self.req_info[req.rid]
+        _sample = partial(self.sample_child, sampling_batch_info, req.seqlen)
 
-        nxt_id = self.sampler(
-                logits_output=LogitsProcessorOutput(next_token_logits=logits[-1:]), 
-                sampling_info=sampling_batch_info,
-                return_logprob=False,
-                top_logprobs_nums=[],
-                token_ids_logprobs=[],
-                positions=req.seqlen,
-                )
-        output_tok.append(nxt_id.item())
-        
+        output_tok, output_kv = lo_cache._match_prefix_helper(
+            node, _sample, req)
+
         # Here we should first check if kv cache is still stored at radix tree
         if tree_cache is not None:
-            token_ids = req_tok.input_tok.tolist() + output_tok[:-1]
+            token_ids = req_info.input_tok.tolist() + output_tok
             match_result = tree_cache.match_prefix(
                 key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
                 **(
@@ -196,6 +193,9 @@ class LogitsRecord:
                     else {}
                 ),
             )
+            if len(token_ids)!=match_result.device_indices.shape[0]:
+                # cache hit miss
+                return False
             (
                 req.last_node,
                 req.last_host_node,
@@ -205,29 +205,28 @@ class LogitsRecord:
                 match_result.last_host_node,
                 match_result.host_hit_length,
             )
-        
-        
+
         # update request info
-        req.fill_ids = req_tok.input_tok.tolist() + output_tok
+        req.fill_ids = req_info.input_tok.tolist() + output_tok
         req.output_ids = output_tok
-        req.origin_input_ids = req_tok.input_tok.tolist()
-        req.prefix_indices = self.req_kv_ind[req.rid].input_tok
-        req.req_kv_indices = self.req_kv_ind[req.rid].all_tok
-        req.extend_input_len = 1 # set this to 1
+        req.origin_input_ids = req_info.input_tok.tolist()
+        req.prefix_indices = req_info.input_tok
+        req.req_kv_indices = torch.cat([req_info.input_kv, output_kv], dim=0)
+        req.extend_input_len = 1
         req.cache_protected_len = len(req.fill_ids) - 1
-        
+
         self.req_already_loaded.add(req.rid)
         return True
 
         # logits_output = LogitsProcessorOutput(next_token_logits=sampled_logits)
         # logits_cache = self.logits_cache[rid]
         # logits_cache.get_sample_result()
-        
-    def generate_sampling_info(self,reqs: List[Req]) -> SamplingBatchInfo:
+
+    def generate_sampling_info(self, reqs: List[Req]) -> SamplingBatchInfo:
         global_server_args = get_global_server_args()
         enable_deterministic = global_server_args.enable_deterministic_inference
         vocab_size = self.model_config.vocab_size
-        
+
         temperatures = torch.tensor(
             [r.sampling_params.temperature for r in reqs],
             dtype=torch.float,
@@ -251,7 +250,7 @@ class LogitsRecord:
             if enable_deterministic
             else None
         )
-        
+
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
             logit_bias = torch.zeros(len(reqs), vocab_size, device="cpu")
@@ -263,40 +262,56 @@ class LogitsRecord:
         merged_custom_logit_processor = None
         custom_params = None
         return SamplingBatchInfo(
-			temperatures=temperatures,
+            temperatures=temperatures,
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
-            need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
-            need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
+            need_top_p_sampling=any(
+                r.sampling_params.top_p != 1.0 for r in reqs),
+            need_top_k_sampling=any(
+                r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
             vocab_size=vocab_size,
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
             device='cpu',
             logit_bias=logit_bias,
-		)
+        )
 
 
 @dataclass
 class LogitsKey:
-    logits: torch.Tensor
-    logits_result: torch.Tensor
+    logits: Union[torch.Tensor, List]
+    logits_result: Union[torch.Tensor, List]
+
+    def __post_init__(self):
+        if torch.is_tensor(self.logits) and self.logits.is_cuda:
+            self.logits = self.logits.to("cpu", non_blocking=True)
+        if torch.is_tensor(self.logits_result) and self.logits_result.is_cuda:
+            self.logits_result = self.logits_result.to(
+                "cpu", non_blocking=True)
 
     def __len__(self) -> int:
         return len(self.logits)
-    
-    
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.logits)
+
+    def __getitem__(self, idx: Union[int, slice]) -> LogitsKey:
+        return LogitsKey(self.logits[idx], self.logits_result[idx])
+
 
 class TreeNode:
     counter = 0
+
     def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
         self.parent: TreeNode = None
         self.key: LogitsKey = None
         self.value: Optional[torch.Tensor] = None
+        self.kv_indice: torch.Tensor = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
@@ -317,12 +332,20 @@ class TreeNode:
         return self.value is None
 
     @property
+    def _device(self):
+        if self.kv_indice is not None:
+            return self.kv_indice.device
+        else:
+            for _, child in self.children.items():
+                return child._device
+
+    @property
     def backuped(self):
         return self.host_value is not None
-    
+
     @property
     def is_null(self) -> bool:
-        return (self.key, self.value) == (None, None)
+        return (self.key, self.value, self.kv_indice) == (None, None, None)
 
     def protect_host(self):
         """Protect the host value from eviction."""
@@ -352,33 +375,30 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-
-def _check_extra_key(key0: LogitsKey, key1: LogitsKey):
-    pass
-    # if key0.extra_key != key1.extra_key:
-    #     raise ValueError(
-    #         f"_key_match should be run on the same extra key, but got key0.extra_key={key0.extra_key} != key1.extra_key={key1.extra_key}"
-    #     )
+# def _check_extra_key(key0: LogitsKey, key1: LogitsKey):
+#     if key0.extra_key != key1.extra_key:
+#         raise ValueError(
+#             f"_key_match should be run on the same extra key, but got key0.extra_key={key0.extra_key} != key1.extra_key={key1.extra_key}"
+#         )
 
 
 def _key_match_page_size1(key0: LogitsKey, key1: LogitsKey):
-    pass
     # _check_extra_key(key0, key1)
-    # i = 0
-    # for k0, k1 in zip(key0.token_ids, key1.token_ids):
-    #     if k0 != k1:
-    #         break
-    #     i += 1
-    # return i
+    i = 0
+    for k0, k1 in zip(key0.logits_result, key1.logits_result):
+        if k0 != k1:
+            break
+        i += 1
+    return i
 
 
 def _key_match_paged(key0: LogitsKey, key1: LogitsKey, page_size: int):
-    _check_extra_key(key0, key1)
+    # _check_extra_key(key0, key1)
     min_len = min(len(key0), len(key1))
 
     i = 0
     while i < min_len:
-        if key0.token_ids[i : i + page_size] != key1.token_ids[i : i + page_size]:
+        if key0.logits_result[i: i + page_size] != key1.logits_result[i: i + page_size]:
             break
         i += page_size
 
@@ -447,7 +467,7 @@ class LogitsCache(BasePrefixCache):
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
-        self.init_time = time.monotonic() # used to evict request info
+        self.init_time = time.monotonic()  # used to evict request info
         self._record_all_cleared_event()
 
     # TODO should we change this to GPU kernel?
@@ -457,9 +477,6 @@ class LogitsCache(BasePrefixCache):
         root_key = self.root_node.key
         for ind in range(root_key.logits.shape[0]):
             next_token_logits = root_key.logits[ind]
-        
-        
-        
 
     # def log_sampling_info(self):
     #     logit_sampling_msg = (
@@ -472,13 +489,12 @@ class LogitsCache(BasePrefixCache):
     #         f"#queue-req: {len(self.waiting_queue)}, "
     #     )
 
-
-    def insert(self, key: LogitsKey, value=None):
+    def insert(self, key: LogitsKey, kv_indice: List, value=None):
         if self.disable:
             return 0
         if value is None:
             value = torch.tensor(key.logits_result, dtype=torch.int64)
-        return self._insert_helper(self.root_node, key, value)
+        return self._insert_helper(self.root_node, key, value, kv_indice)
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
@@ -565,35 +581,54 @@ class LogitsCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: LogitsKey):
-        access_time = time.monotonic()
-        node.last_access_time = access_time
+    def _match_prefix_helper(self, node: TreeNode, _sample: Callable[[Union[torch.Tensor, TreeNode]], int], req: Req) -> Tuple[List, torch.Tensor]:
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        child_key = _sample(node.key.logits)
+        child_key = child_key.item()
+        output_tok: List[int] = [child_key]
+        output_kv: List[int] = []
+        eos_set = set(req.eos_token_ids)
+        should_exit = False
+        _device = node._device
 
-        child_key = self.get_child_key_fn(key)
-
-        value = []
-        while len(key) > 0 and child_key in node.children.keys():
-            child = node.children[child_key]
-            child.last_access_time = access_time
-            prefix_len = self.key_match_fn(child.key, key)
-            if prefix_len < len(child.key):
-                new_node = self._split_node(child.key, child, prefix_len)
-                value.append(new_node.value)
-                node = new_node
+        while not should_exit:
+            child = node.children.get(child_key)
+            if child is None:
                 break
-            else:
-                value.append(child.value)
-                node = child
-                key = key[prefix_len:]
+            output_kv.append(child.kv_indice[0])
 
-                if len(key):
-                    child_key = self.get_child_key_fn(key)
+            logits_res = child.key.logits_result
+            kv_indices = child.kv_indice
 
-        return value, node
+            for idx in range(1, len(logits_res)):
+                cur_logit = LogitsProcessorOutput(
+                    next_token_logits=child.key.logits[idx:idx + 1]
+                )
+                nxt_id = _sample(cur_logit).item()
+                output_tok.append(nxt_id)
+
+                if logits_res[idx] != nxt_id:
+                    should_exit = True
+                    break
+                output_kv.append(kv_indices[idx])
+
+                if nxt_id in eos_set:
+                    should_exit = True
+                    break
+            node = child
+            if should_exit:
+                break
+            child_key = nxt_id
+
+        output_kv = [t.reshape(1) if t.ndim == 0 else t for t in output_kv]
+        output_kv = torch.cat(output_kv, dim=0) if len(
+            output_kv) else torch.empty((0,), device=_device)
+        return output_tok, output_kv
 
     def _split_node(self, key: LogitsKey, child: TreeNode, split_len: int):
         # new_node -> child
-        self._record_remove_event(child)
+        if split_len == 0:
+            return child
         new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
@@ -605,26 +640,21 @@ class LogitsCache(BasePrefixCache):
         child.value = child.value[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
-        self._record_store_event(new_node)
-        self._record_store_event(child)
-
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: LogitsKey, value: torch.Tensor):
+    def _insert_helper(self, node: TreeNode, key: LogitsKey, value: torch.Tensor, kv_indice: List):
         access_time = time.monotonic()
         node.last_access_time = access_time
         if len(key) == 0:
             return 0
 
-        child_key = self.get_child_key_fn(key)
-        # first init root node is null
+        # first init root node is null, we put first logits into root
         if node.is_null:
-            node.key = key
-            node.value = value
+            node.key = key[0]
             node.lock_ref += 1
-            self.evictable_size_ += len(key)
-            return 0
+            self.evictable_size_ += 1
 
+        child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
@@ -633,6 +663,7 @@ class LogitsCache(BasePrefixCache):
             total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
+            kv_indice = kv_indice[prefix_len:]
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -646,6 +677,7 @@ class LogitsCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
+            new_node.kv_indice = kv_indice
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)
@@ -718,7 +750,7 @@ class LogitsCache(BasePrefixCache):
                 parent_block_hash = hash(tuple(parent_parent_tokens))
 
             for start in range(0, len(node.key), self.page_size):
-                page_tokens = node.key.token_ids[start : start + self.page_size]
+                page_tokens = node.key.token_ids[start: start + self.page_size]
                 if not page_tokens:
                     continue
 
@@ -741,11 +773,12 @@ class LogitsCache(BasePrefixCache):
         # One BlockRemoved per chunk.
         if self.enable_kv_cache_events:
             for start in range(0, len(node.key), self.page_size):
-                page_tokens = node.key.token_ids[start : start + self.page_size]
+                page_tokens = node.key.token_ids[start: start + self.page_size]
                 if not page_tokens:
                     continue
                 block_hash = hash(tuple(page_tokens))
-                self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+                self.kv_event_queue.append(
+                    BlockRemoved(block_hashes=[block_hash]))
 
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
@@ -773,15 +806,15 @@ class LogitsCache(BasePrefixCache):
         pass
 
 
-if __name__ == "__main__":
-    tree = LogitsCache(page_size=1, disable=False)
+# if __name__ == "__main__":
+#     tree = LogitsCache(page_size=1, disable=False)
 
-    # Example token id sequences (as lists of ints)
-    tree.insert("123", LogitsKey(logits=[1, 2, 3], logits_result=0))
-    tree.insert("123", LogitsKey(logits=[1, 2, 3], logits_result=1))
-    tree.insert("123", LogitsKey(logits=[1, 2, 4, 5], logits_result=1))
-    tree.insert("123", LogitsKey(logits=[1, 2, 4, 5, 6, 7], logits_result=1))
-    tree.insert("123", LogitsKey(logits=[8, 9, 10, 11, 12], logits_result=1))
-    tree.pretty_print()
+#     # Example token id sequences (as lists of ints)
+#     tree.insert("123", LogitsKey(logits=[1, 2, 3], logits_result=0))
+#     tree.insert("123", LogitsKey(logits=[1, 2, 3], logits_result=1))
+#     tree.insert("123", LogitsKey(logits=[1, 2, 4, 5], logits_result=1))
+#     tree.insert("123", LogitsKey(logits=[1, 2, 4, 5, 6, 7], logits_result=1))
+#     tree.insert("123", LogitsKey(logits=[8, 9, 10, 11, 12], logits_result=1))
+#     tree.pretty_print()
 
-    # print(tree.match_prefix(LogitsKey(token_ids=[1, 2, 3, 13, 14], extra_key=None)))
+#     # print(tree.match_prefix(LogitsKey(token_ids=[1, 2, 3, 13, 14], extra_key=None)))

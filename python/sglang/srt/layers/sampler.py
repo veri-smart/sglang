@@ -69,6 +69,7 @@ class Sampler(nn.Module):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
+        is_cpu: bool = False,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -131,7 +132,7 @@ class Sampler(nn.Module):
                     positions=positions,
                 )
             else:
-                if get_global_server_args().sampling_backend == "flashinfer":
+                if get_global_server_args().sampling_backend == "flashinfer" and not is_cpu:
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)
@@ -146,7 +147,7 @@ class Sampler(nn.Module):
                             filter_apply_order="joint",
                             check_nan=self.use_nan_detection,
                         )
-                elif get_global_server_args().sampling_backend == "pytorch":
+                elif get_global_server_args().sampling_backend == "pytorch" or is_cpu:
                     # A slower fallback implementation with torch native operations.
                     batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                         probs,

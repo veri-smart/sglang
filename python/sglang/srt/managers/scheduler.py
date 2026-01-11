@@ -1866,6 +1866,12 @@ class Scheduler(
             if self.last_batch is None:
                 # preserve safety
                 self.last_batch = decode_batch
+            # add running batch
+            if self.running_batch.is_empty():
+                self.running_batch = self.last_batch
+            else:
+                # Merge running_batch with prefill batch
+                self.running_batch.merge_batch(self.last_batch)
             return decode_batch
 
 
