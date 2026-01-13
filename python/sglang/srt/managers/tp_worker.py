@@ -394,6 +394,10 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            if model_worker_batch.enable_logits_cache:
+                logits_output.cloned_next_token_logits = (
+                    logits_output.next_token_logits.detach().clone()
+                )
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,

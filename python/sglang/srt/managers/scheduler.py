@@ -1860,6 +1860,7 @@ class Scheduler(
                self.enable_overlap,
                self.spec_algorithm,
                chunked_req=self.chunked_req,
+               enable_logits_cache=True,
             )
             decode_batch.prepare_for_cached_decode()
             self.waiting_queue = [x for x in self.waiting_queue if x not in cached_decode_batch]
@@ -1923,6 +1924,7 @@ class Scheduler(
             self.spec_algorithm,
             chunked_req=self.chunked_req,
             dllm_config=self.dllm_config,
+            enable_logits_cache=True if self.logits_recorder.enable_logits_cache else False
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered

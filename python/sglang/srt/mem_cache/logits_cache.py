@@ -112,7 +112,7 @@ class LogitsRecord:
     def record_batch(self, batch: ScheduleBatch, logits_info: GenerationBatchResult):
         if self.enable_logits_cache is False:
             return
-        logits = logits_info.logits_output.next_token_logits
+        logits = logits_info.logits_output.cloned_next_token_logits
         logits_results = logits_info.next_token_ids
         for ind, req in enumerate(batch.reqs):
             if req.rid in self.req_logits_key:
@@ -172,7 +172,7 @@ class LogitsRecord:
             return False
         if req.rid in self.req_already_loaded:
             return False
-        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
         lo_cache = self.logits_cache[req.rid]
         node = self.logits_cache[req.rid].root_node
         sampling_batch_info = self.generate_sampling_info([req])
@@ -665,7 +665,7 @@ class LogitsCache(BasePrefixCache):
             value = value[prefix_len:]
             kv_indice = kv_indice[prefix_len:]
 
-            if prefix_len < len(node.key):
+            if prefix_len < len(node.key.logits_result):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 

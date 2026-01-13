@@ -1203,6 +1203,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+    
+    # logits cache
+    enable_logits_cache: bool = False
 
     @classmethod
     def init_new(
@@ -1216,6 +1219,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
+        enable_logits_cache: bool = False,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -1245,6 +1249,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
+            enable_logits_cache=enable_logits_cache,
         )
 
     def batch_size(self):
@@ -2077,6 +2082,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            enable_logits_cache=self.enable_logits_cache
         )
 
     def copy(self):
@@ -2199,3 +2205,6 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+    
+    # For logits cache
+    enable_logits_cache: bool = False
