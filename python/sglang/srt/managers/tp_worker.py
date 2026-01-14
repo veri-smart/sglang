@@ -394,10 +394,12 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
-            if model_worker_batch.enable_logits_cache:
-                logits_output.cloned_next_token_logits = (
-                    logits_output.next_token_logits.detach().clone()
-                )
+
+            cache_inds = [i for i, req in enumerate(model_worker_batch.reqs) if req.should_cache]
+            if cache_inds:
+                idx = torch.tensor(cache_inds, device=logits_output.next_token_logits.device)
+                logits_output.cloned_next_token_logits = logits_output.next_token_logits.index_select(0, idx).detach().clone()
+                
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,

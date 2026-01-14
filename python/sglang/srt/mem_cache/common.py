@@ -530,6 +530,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True, is_complete: bool = False):
+    """
+	is_complete: 是否在 radix tree 中缓存整个 req 的 kvcache
+	"""
     tree_cache.cache_finished_req(req, is_insert=is_insert, is_complete=is_complete)
     start_p, end_p = req.pop_overallocated_kv_cache()
 

@@ -880,7 +880,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.stream,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
-                logits_cached=obj.logits_cached,
+                r_type=obj.r_type,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
@@ -893,6 +893,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                p_rid=obj.p_rid,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

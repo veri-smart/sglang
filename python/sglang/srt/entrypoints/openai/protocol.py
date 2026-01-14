@@ -37,7 +37,7 @@ from pydantic import (
     model_validator,
 )
 from typing_extensions import Literal
-
+from enum import IntEnum, unique
 try:
     from xgrammar import StructuralTag
 except:
@@ -49,6 +49,16 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
 
+@unique
+class Req_type(IntEnum):
+    """ 
+	REQUEST: 用于一个节点第一次采样
+    RESAMPLE: 用于一个节点的再次采样
+    PREFETCH: 用于speculative地选择了下一个节点，但仍然需要等待之前节点的结果的情况，未来实际选择该节点时可以增加一段context
+	"""
+    REQUEST = 0,
+    RESAMPLE = 1,
+    PREFETCH = 2,
 
 class ModelCard(BaseModel):
     """Model cards."""
@@ -518,6 +528,10 @@ class ChatCompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+    # For request type
+    r_type: Optional[Union[List[Req_type], Req_type]] = None
+    # For prefetched rid
+    p_rid: Optional[Union[List[str], str]] = None
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching

@@ -811,18 +811,6 @@ class Scheduler(
                 )
             )
         )
-        
-        if server_args.enable_logits_cache:
-            # TODO
-            from sglang.srt.mem_cache.logits_cache import LogitsCache
-            self.logits_cache = LogitsCache(
-                page_size=self.page_size,
-                disable=server_args.disable_radix_cache,
-                enable_metrics=self.enable_metrics,
-                enable_kv_cache_events=self.enable_kv_cache_events,
-                eviction_policy=server_args.radix_eviction_policy,
-                is_eagle=self.spec_algorithm.is_eagle(),
-			)
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
@@ -1335,7 +1323,8 @@ class Scheduler(
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
-                logits_cached=recv_req.logits_cached
+                r_type=recv_req.r_type,
+                p_rid=recv_req.p_rid
             )
             req.tokenizer = self.tokenizer
 
@@ -1826,7 +1815,8 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
             
-            if self.logits_recorder.enable_logits_cache:
+            # if self.logits_recorder.enable_logits_cache:
+            if req.logits_cached:
                 match_result = self.logits_recorder.get_logits_cache(req, self.tree_cache)
                 if match_result:
                     cached_decode_batch.append(req)
@@ -1924,7 +1914,7 @@ class Scheduler(
             self.spec_algorithm,
             chunked_req=self.chunked_req,
             dllm_config=self.dllm_config,
-            enable_logits_cache=True if self.logits_recorder.enable_logits_cache else False
+            enable_logits_cache=False
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered

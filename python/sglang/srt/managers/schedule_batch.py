@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import enum
-
+from sglang.srt.entrypoints.openai.protocol import Req_type
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.mem_cache.logits_cache import LogitsRecord
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -488,7 +488,8 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
-        logits_cached :bool = False,
+        r_type: Req_type = None,
+        p_rid: str = None,
     ):
         # Input and output info
         self.rid = rid
@@ -657,7 +658,8 @@ class Req:
                 self.output_token_ids_logprobs_idx
             ) = None
         self.hidden_states: List[List[float]] = []
-        self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
+        # Note: use tensor instead of list to transfer hidden_states when PD + MTP
+        self.hidden_states_tensor = None
         self.output_topk_p = None
         self.output_topk_index = None
 
@@ -713,10 +715,10 @@ class Req:
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
-        
-        # For Logits Cache
-        self.logits_cached = logits_cached
 
+        # For Logits Cache
+        self.r_type = r_type
+        self.p_rid = p_rid
         # For diffusion LLM
         self.dllm_ids = []
         self.dllm_block_offset = 0
@@ -741,6 +743,14 @@ class Req:
         if self.finished_len is not None:
             return self.output_ids[: self.finished_len]
         return self.output_ids
+
+    @property
+    def logits_cached(self) -> bool:
+        return self.r_type in (Req_type.RESAMPLE, Req_type.PREFETCH)
+
+    @property
+    def should_cache(self) -> bool:
+        return self.r_type == Req_type.REQUEST
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
@@ -1074,7 +1084,8 @@ class Req:
             logger.error(f"{error_msg}, {self.rid=}")
         self.multimodal_inputs = None
         self.grammar = None
-        self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        # set it to one token to skip the long prefill
+        self.origin_input_ids = [0]
         self.return_logprob = False
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
@@ -1294,15 +1305,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # NOTE: the encoder part should be considered as a whole
                 assert len(req.prefix_indices) == 0
                 input_ids[i] = input_ids[i][encoder_len:]
-                encoder_out_cache_loc.append(self.out_cache_loc[pt : pt + encoder_len])
+                encoder_out_cache_loc.append(
+                    self.out_cache_loc[pt: pt + encoder_len])
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt + encoder_len : pt + req.extend_input_len]
+                    self.out_cache_loc[pt +
+                                       encoder_len: pt + req.extend_input_len]
                 )
                 self.extend_lens[i] -= encoder_len
                 self.extend_num_tokens -= encoder_len
             else:
                 decoder_out_cache_loc.append(
-                    self.out_cache_loc[pt : pt + req.extend_input_len]
+                    self.out_cache_loc[pt: pt + req.extend_input_len]
                 )
                 self.prefix_lens[i] -= encoder_len
 
@@ -1342,10 +1355,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        input_ids = [r.fill_ids[len(r.prefix_indices):] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
-        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
+        orig_seq_lens = [max(len(r.fill_ids), len(
+            r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
@@ -1407,7 +1421,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # If req.input_embeds is already a list, append its content directly
-                input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
+                # Use extend to avoid nesting
+                input_embeds.extend(req.input_embeds)
 
             multimodal_inputs.append(req.multimodal_inputs)
 
@@ -1474,7 +1489,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     global_start_idx = req.logprob_start_len
 
                 logprob_token_ids = req.origin_input_ids[
-                    global_start_idx + 1 : global_end_idx + 1
+                    global_start_idx + 1: global_end_idx + 1
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
@@ -1511,7 +1526,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for mm_item in mm_input.mm_items:
                 pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
-                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
+                    mm_item.feature = pixel_values.to(
+                        self.device, non_blocking=True)
                 elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
                     mm_item.feature = pixel_values.reconstruct_on_target_device(
                         torch.cuda.current_device()
@@ -1524,7 +1540,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
             self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
 
-        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        self.extend_logprob_start_lens = [
+            r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if self.model_config.is_encoder_decoder:
@@ -1550,7 +1567,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.extend_input_len = 1
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
-        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        out_cache_loc = torch.cat(
+            [self.out_cache_loc, running_batch.out_cache_loc])
 
         self.merge_batch(running_batch)
         self.input_ids = input_ids
@@ -1682,7 +1700,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Reqs in batch are filtered
         total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
-        total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in self.reqs)
+        total_max_new_tokens = sum(
+            r.sampling_params.max_new_tokens for r in self.reqs)
 
         new_estimate_ratio = (
             total_decoded_tokens
@@ -1718,9 +1737,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
-        self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
-        self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.orig_seq_lens = torch.empty(
+            0, dtype=torch.int32, device=self.device)
+        self.out_cache_loc = torch.empty(
+            0, dtype=torch.int64, device=self.device)
+        self.req_pool_indices = torch.empty(
+            0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -1809,7 +1831,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         output_ids = [r.output_ids for r in reqs]
         extend_num_tokens = len(reqs)
         seq_lens = [len(r.fill_ids) for r in reqs]
-        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
+        orig_seq_lens = [max(len(r.fill_ids), len(
+            r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
         req_kv_lens = [len(r.req_kv_indices) for r in reqs]
@@ -1860,12 +1883,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len = seq_len
             req.kv_allocated_len = seq_len
 
-
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
             req.is_retracted = False
 
-            
         extend_input_logprob_token_ids = None
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
@@ -1875,7 +1896,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
 
-        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+        self.extend_logprob_start_lens = [
+            r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if self.model_config.is_encoder_decoder:
@@ -1886,8 +1908,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
-        
-
 
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:
@@ -1931,11 +1951,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = self.encoder_lens[keep_indices_device]
-            self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
+            self.encoder_lens_cpu = [self.encoder_lens_cpu[i]
+                                     for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
-            self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
+            self.multimodal_inputs = [
+                self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
@@ -1945,8 +1967,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.output_ids = self.output_ids[keep_indices_device]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
-            self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
-            self.token_ids_logprobs = [self.token_ids_logprobs[i] for i in keep_indices]
+            self.top_logprobs_nums = [
+                self.top_logprobs_nums[i] for i in keep_indices]
+            self.token_ids_logprobs = [
+                self.token_ids_logprobs[i] for i in keep_indices]
         else:
             self.top_logprobs_nums = None
             self.token_ids_logprobs = None
@@ -1977,14 +2001,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Encoder-decoder infos
         if self.model_config.is_encoder_decoder:
-            self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
+            self.encoder_lens = torch.cat(
+                [self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
         self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
-        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
+        self.orig_seq_lens = torch.cat(
+            [self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
@@ -1996,8 +2022,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums.extend([0] * len(other.reqs))
             self.token_ids_logprobs.extend([None] * len(other.reqs))
         elif other.return_logprob:
-            self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
-            self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
+            self.top_logprobs_nums = [0] * \
+                len(self.reqs) + other.top_logprobs_nums
+            self.token_ids_logprobs = [None] * \
+                len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
         if self.multimodal_inputs is not None:
             self.multimodal_inputs.extend(other.multimodal_inputs)
@@ -2022,7 +2050,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.sampling_info:
             if self.has_grammar:
-                self.sampling_info.grammars = [req.grammar for req in self.reqs]
+                self.sampling_info.grammars = [
+                    req.grammar for req in self.reqs]
             else:
                 self.sampling_info.grammars = None
 
@@ -2205,6 +2234,6 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
-    
+
     # For logits cache
     enable_logits_cache: bool = False

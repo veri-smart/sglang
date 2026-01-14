@@ -28,7 +28,7 @@ from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
-
+from sglang.srt.entrypoints.openai.protocol import Req_type
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -40,7 +40,7 @@ else:
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
     http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
-    logits_cached :Union[bool, List[bool]] = field(default=None, kw_only=True)
+    r_type :Union[Req_type, List[Req_type]] = field(default=None, kw_only=True)
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -176,7 +176,10 @@ class GenerateReqInput(BaseReq):
     log_metrics: bool = True
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
-
+    # For request type
+    r_type: Optional[Union[Req_type, List[Req_type]]] = None
+    # For prefetched rid
+    p_rid: Optional[Union[List[str], str]] = None
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
     # Session info for continual prompting
@@ -331,11 +334,14 @@ class GenerateReqInput(BaseReq):
         """Normalize inputs for a single example."""
         if self.sampling_params is None:
             self.sampling_params = {}
-        if self.rid is not None:
-            self.logits_cached = True
+        if self.r_type is Req_type.REQUEST:
+            self.rid = None 
+        if self.r_type is Req_type.RESAMPLE:
+            assert self.rid != None
+        if self.r_type is Req_type.PREFETCH:
+            assert self.p_rid != None
         if self.rid is None:
             self.rid = uuid.uuid4().hex
-            self.logits_cached = False
         if self.return_logprob is None:
             self.return_logprob = False
         if self.logprob_start_len is None:
@@ -705,6 +711,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+    
+    # prefecth rid
+    p_rid: str = None
 
 
 @dataclass

@@ -367,13 +367,11 @@ class SchedulerOutputProcessorMixin:
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         release_kv_cache(req, self.tree_cache)
                 else:
-                    if self.logits_recorder.enable_logits_cache:
+                    if req.should_cache:
                       history_logits, _ = self.logits_recorder.summary(req.rid)
                       self.logits_recorder.update_req(req, history_logits)
-                    release_kv_cache(req, self.tree_cache, is_complete=self.logits_recorder.enable_logits_cache)
-                # Once the request is finished, we should add the whole decode token to logits cache
-                # if self.enable_logits_cache:
-                #     self.logits_cache.insert(req.rid, LogitsKey())
+                    release_kv_cache(req, self.tree_cache, is_complete=req.should_cache)
+                    
                 req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():

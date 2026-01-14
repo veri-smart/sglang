@@ -1,5 +1,6 @@
 from __future__ import annotations
 import heapq
+import logging
 import time
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from collections import defaultdict
@@ -32,6 +33,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Recorder:
@@ -69,11 +72,10 @@ class LogitsRecord:
 
     def __post_init__(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
-        if self.server_args.enable_logits_cache:
-            self.req_logits_key = {}
-            self.logits_cache = {}
-            self.req_info = {}
-            self.req_already_loaded = set()
+        self.req_logits_key = {}
+        self.logits_cache = {}
+        self.req_info = {}
+        self.req_already_loaded = set()
 
     @property
     def sampler(self):
@@ -81,10 +83,6 @@ class LogitsRecord:
             from sglang.srt.layers.sampler import Sampler
             self._sampler = Sampler()
         return self._sampler
-
-    @cached_property
-    def enable_logits_cache(self) -> bool:
-        return self.req_logits_key is not None
 
     def sample_child(self, sampling_info: SamplingBatchInfo, seq_len, logits: Union[torch.Tensor, LogitsProcessorOutput]) -> int:
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -110,14 +108,13 @@ class LogitsRecord:
         return nxt_id
 
     def record_batch(self, batch: ScheduleBatch, logits_info: GenerationBatchResult):
-        if self.enable_logits_cache is False:
-            return
         logits = logits_info.logits_output.cloned_next_token_logits
         logits_results = logits_info.next_token_ids
         for ind, req in enumerate(batch.reqs):
+            if not req.should_cache:
+                continue
             if req.rid in self.req_logits_key:
-                self.req_logits_key[req.rid].append(
-                    LogitsKey(logits[ind], logits_results[ind]))
+                self.req_logits_key[req.rid].append(LogitsKey(logits[ind], logits_results[ind]))
                 continue
             if batch.forward_mode.is_decode():
                 # forget cached request
@@ -135,8 +132,6 @@ class LogitsRecord:
                 page_size=1, disable=False)
 
     def summary(self, rid: str) -> Optional[Tuple[torch.Tensor, List[int]]]:
-        if self.enable_logits_cache is False:
-            return None
         assert rid in self.req_logits_key, "rid must stored at req_logits_key"
         logits_seq = self.req_logits_key[rid]
         history_logits = torch.stack([key.logits for key in logits_seq], dim=0)
@@ -148,8 +143,6 @@ class LogitsRecord:
         return history_logits, token_ids
 
     def update_req(self, req: Req, history_logits: torch.Tensor):
-        if self.enable_logits_cache is False:
-            return
         committed_kv_len = req.kv_committed_len
         logits_token_ids = req.output_ids[:committed_kv_len -
                                           len(req.origin_input_ids)]
@@ -166,8 +159,6 @@ class LogitsRecord:
             self.req_already_loaded.remove(req.rid)
 
     def get_logits_cache(self, req: Req, tree_cache: Optional[BasePrefixCache] = None) -> bool:
-        if self.enable_logits_cache is False:
-            return False
         if req.rid not in self.logits_cache:
             return False
         if req.rid in self.req_already_loaded:
@@ -196,6 +187,7 @@ class LogitsRecord:
             if len(token_ids)!=match_result.device_indices.shape[0]:
                 # cache hit miss
                 return False
+            self.log_cache_info(req, len(token_ids))
             (
                 req.last_node,
                 req.last_host_node,
@@ -218,9 +210,11 @@ class LogitsRecord:
         self.req_already_loaded.add(req.rid)
         return True
 
-        # logits_output = LogitsProcessorOutput(next_token_logits=sampled_logits)
-        # logits_cache = self.logits_cache[rid]
-        # logits_cache.get_sample_result()
+
+    def log_cache_info(self, req: Req, cached_tok: int):
+        msg = f"Request {req.rid}, #cached-token: {cached_tok}"
+        logger.info(msg)
+
 
     def generate_sampling_info(self, reqs: List[Req]) -> SamplingBatchInfo:
         global_server_args = get_global_server_args()
