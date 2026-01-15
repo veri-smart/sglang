@@ -1,10 +1,12 @@
 from __future__ import annotations
 import heapq
+from queue import Queue, Empty
+import threading
 import logging
 import time
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from collections import defaultdict
-from functools import lru_cache, partial, cached_property
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, List, Optional, Tuple, Dict, Set, Iterator, Union, Callable
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
@@ -60,22 +62,30 @@ class Recorder:
 class LogitsRecord:
     req_to_token_pool: ReqToTokenPool
     server_args: ServerArgs
-    req_logits_key: Dict[str, List[LogitsKey]] | None = None
-    logits_cache: Dict[str, LogitsCache] | None = None
-    # record the req's kv indices
-    # record the req's input token and kv
-    req_info: Dict[str, Recorder] | None = None
+    tree_cache: BasePrefixCache
+    # runtime states
+    req_logits_key: Dict[str, List[LogitsKey]] = field(default_factory=dict)
+    logits_cache: Dict[str, LogitsCache] = field(default_factory=dict)
+    req_info: Dict[str, Recorder] = field(default_factory=dict)
+    # mark a request's logits kv cache is already loaded
+    req_already_loaded: Set[str] = field(default_factory=set)
+
     _sampler: Optional[object] = field(default=None, repr=False)
     model_config: Optional[ModelConfig] = field(default=None, repr=False)
-    # mark a request's logits kv cache is already loaded
-    req_already_loaded: Set[str] | None = None
+    # used as async pre-compute logits cache
+    producer_queue: Queue[Req] =field(default_factory=Queue, repr=False)
+    consumer_queue: Dict[str, Queue[Tuple[List[int], List[int]]]] = field(default_factory=dict, repr=False)
+    event_pool: Dict[str, threading.Event] = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
-        self.req_logits_key = {}
-        self.logits_cache = {}
-        self.req_info = {}
-        self.req_already_loaded = set()
+        
+        t = threading.Thread(
+            target=self.produce_nxt_logits,
+            name="precompute-worker",
+            daemon=True,
+        )
+        t.start()
 
     @property
     def sampler(self):
@@ -130,6 +140,7 @@ class LogitsRecord:
                 req.origin_input_ids, ins_kv_indices)
             self.logits_cache[req.rid] = LogitsCache(
                 page_size=1, disable=False)
+            self.consumer_queue[req.rid] = Queue()
 
     def summary(self, rid: str) -> Optional[Tuple[torch.Tensor, List[int]]]:
         assert rid in self.req_logits_key, "rid must stored at req_logits_key"
@@ -142,7 +153,7 @@ class LogitsRecord:
         ]
         return history_logits, token_ids
 
-    def update_req(self, req: Req, history_logits: torch.Tensor):
+    def update_req(self, req: Req, history_logits: torch.Tensor, tree_cache: Optional[BasePrefixCache] = None):
         committed_kv_len = req.kv_committed_len
         logits_token_ids = req.output_ids[:committed_kv_len -
                                           len(req.origin_input_ids)]
@@ -153,38 +164,60 @@ class LogitsRecord:
         cache_tree.insert(
             LogitsKey(history_logits, logits_token_ids), kv_indice=kv_indices)
         cache_tree.init_time = time.monotonic()  # update timing
+        # gen nxt logits
+        self.producer_queue.put(req)
         # clear request info
         self.req_logits_key.pop(req.rid)
         if req.rid in self.req_already_loaded:
             self.req_already_loaded.remove(req.rid)
 
-    def get_logits_cache(self, req: Req, tree_cache: Optional[BasePrefixCache] = None) -> bool:
-        if req.rid not in self.logits_cache:
-            return False
-        if req.rid in self.req_already_loaded:
-            return False
+    def produce_nxt_logits(self):
+        """
+        Once a request is done, we can pre-compute it's next logits result
+        """
+        while True:
+            req = self.producer_queue.get()
 
-        lo_cache = self.logits_cache[req.rid]
-        node = self.logits_cache[req.rid].root_node
-        sampling_batch_info = self.generate_sampling_info([req])
+            if req.rid not in self.logits_cache:
+                continue
+            if req.rid in self.req_already_loaded:
+                continue
+
+            e = self.event_pool.setdefault(req.rid, threading.Event())
+            e.clear
+            lo_cache = self.logits_cache[req.rid]
+            node = lo_cache.root_node
+            sampling_batch_info = self.generate_sampling_info([req])
+            _sample = partial(self.sample_child, sampling_batch_info, req.seqlen)
+            # this may consume much time
+            output_tok, output_kv = lo_cache._match_prefix_helper(node, _sample, req)
+            self.consumer_queue[req.rid].put((output_tok, output_kv))
+            e.set()
+    
+
+    def get_logits_cache(self, req: Req) -> bool:
+        if req.rid not in self.req_info:
+            return False
+        self.event_pool[req.rid].wait()
         req_info = self.req_info[req.rid]
-        _sample = partial(self.sample_child, sampling_batch_info, req.seqlen)
-
-        output_tok, output_kv = lo_cache._match_prefix_helper(
-            node, _sample, req)
+        con_q = self.consumer_queue[req.rid]
+        try:
+            output_tok, output_kv = con_q.get_nowait()
+        except Empty:
+            return False
 
         # Here we should first check if kv cache is still stored at radix tree
-        if tree_cache is not None:
+        if self.tree_cache is not None:
             token_ids = req_info.input_tok.tolist() + output_tok
-            match_result = tree_cache.match_prefix(
+            match_result = self.tree_cache.match_prefix(
                 key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
                 **(
                     {"req": self, "cow_mamba": True}
-                    if isinstance(tree_cache, MambaRadixCache)
+                    if isinstance(self.tree_cache, MambaRadixCache)
                     else {}
                 ),
             )
-            if len(token_ids)!=match_result.device_indices.shape[0]:
+            if len(token_ids) != match_result.device_indices.shape[0]:
                 # cache hit miss
                 return False
             self.log_cache_info(req, len(token_ids))
@@ -464,24 +497,6 @@ class LogitsCache(BasePrefixCache):
         self.init_time = time.monotonic()  # used to evict request info
         self._record_all_cleared_event()
 
-    # TODO should we change this to GPU kernel?
-    # currently we don't support custom logits processor
-    def get_sample_result(self):
-        assert not self.root_node.is_null
-        root_key = self.root_node.key
-        for ind in range(root_key.logits.shape[0]):
-            next_token_logits = root_key.logits[ind]
-
-    # def log_sampling_info(self):
-    #     logit_sampling_msg = (
-    #         f"Sampling batch{iter_msg}, "
-    #         f"#new-seq: {len(can_run_list)}, "
-    #         f"#new-token: {adder.log_input_tokens}, "
-    #         f"#cached-token: {adder.log_hit_tokens}, "
-    #         f"{token_usage_msg}"
-    #         f"#running-req: {running_bs}, "
-    #         f"#queue-req: {len(self.waiting_queue)}, "
-    #     )
 
     def insert(self, key: LogitsKey, kv_indice: List, value=None):
         if self.disable:

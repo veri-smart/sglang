@@ -369,7 +369,7 @@ class SchedulerOutputProcessorMixin:
                 else:
                     if req.should_cache:
                       history_logits, _ = self.logits_recorder.summary(req.rid)
-                      self.logits_recorder.update_req(req, history_logits)
+                      self.logits_recorder.update_req(req, history_logits, self.tree_cache)
                     release_kv_cache(req, self.tree_cache, is_complete=req.should_cache)
                     
                 req.time_stats.completion_time = time.perf_counter()

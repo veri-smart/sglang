@@ -429,7 +429,9 @@ class Scheduler(
         # Init memory pool and cache
         self.init_cache_with_memory_pool()
         
-        self.logits_recorder = LogitsRecord(self.req_to_token_pool, server_args)
+        self.logits_recorder = LogitsRecord(req_to_token_pool=self.req_to_token_pool, 
+                                            server_args=server_args, 
+                                            tree_cache=self.tree_cache)
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -1817,7 +1819,7 @@ class Scheduler(
             
             # if self.logits_recorder.enable_logits_cache:
             if req.logits_cached:
-                match_result = self.logits_recorder.get_logits_cache(req, self.tree_cache)
+                match_result = self.logits_recorder.get_logits_cache(req)
                 if match_result:
                     cached_decode_batch.append(req)
                     continue
