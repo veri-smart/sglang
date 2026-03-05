@@ -17,6 +17,7 @@ from sglang.lang.ir import (
     SglSelect,
     SglSeparateReasoning,
     SglVideo,
+    SglAgent,
 )
 
 
@@ -31,6 +32,17 @@ def function(
 
     return decorator
 
+
+def agent(
+    func: Optional[Callable] = None,
+):
+    if func:
+        return SglAgent(func)
+
+    def decorator(func):
+        return SglAgent(func)
+
+    return decorator
 
 def Runtime(*args, **kwargs):
     # Avoid importing unnecessary dependency

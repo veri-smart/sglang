@@ -3,7 +3,7 @@
 import dataclasses
 import inspect
 import warnings
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 from sglang.global_config import global_config
 from sglang.lang.choices import ChoicesSamplingMethod
@@ -136,6 +136,129 @@ class SglSamplingParams:
             "regex": self.regex,
             "json_schema": self.json_schema,
         }
+
+class SglAgent:
+    def __init__(self, agent):
+        self.agent = agent
+        self.agent_name = getattr(agent, "__name__", agent.__class__.__name__)
+
+    def __call__(self, *args, **kwargs):
+        instance = self.agent(*args, **kwargs)
+        return _SglAgentInstance(instance, self.agent_name)
+
+
+class _SglAgentInstance:
+    def __init__(self, instance, agent_name: str):
+        self._instance = instance
+        self._agent_name = agent_name
+        self._stats = {
+            "num_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+        }
+
+    def get_stats(self):
+        prompt_tokens = self._stats["prompt_tokens"]
+        return {
+            **self._stats,
+            "cache_hit_rate": (
+                self._stats["cached_tokens"] / prompt_tokens if prompt_tokens else 0.0
+            ),
+            "total_tokens": self._stats["prompt_tokens"]
+            + self._stats["completion_tokens"],
+        }
+
+    def reset_stats(self):
+        self._stats = {
+            "num_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+        }
+
+    def _maybe_update_stats(self, ret: Any):
+        call_prompt_tokens = 0
+        call_completion_tokens = 0
+        call_cached_tokens = 0
+
+        def _update_from_meta(meta):
+            nonlocal call_prompt_tokens, call_completion_tokens, call_cached_tokens
+            if not isinstance(meta, dict):
+                return
+            call_prompt_tokens += int(meta.get("prompt_tokens") or 0)
+            call_completion_tokens += int(meta.get("completion_tokens") or 0)
+            call_cached_tokens += int(meta.get("cached_tokens") or 0)
+
+        def _collect(result):
+            if result is None:
+                return
+            if hasattr(result, "stream_executor") and hasattr(
+                result.stream_executor, "meta_info"
+            ):
+                if not result.stream_executor.stream:
+                    result.sync()
+                for v in result.stream_executor.meta_info.values():
+                    _update_from_meta(v)
+                return
+            if isinstance(result, (list, tuple)):
+                for x in result:
+                    _collect(x)
+
+        _collect(ret)
+        if (
+            call_prompt_tokens == 0
+            and call_completion_tokens == 0
+            and call_cached_tokens == 0
+        ):
+            return
+
+        self._stats["num_calls"] += 1
+        self._stats["prompt_tokens"] += call_prompt_tokens
+        self._stats["completion_tokens"] += call_completion_tokens
+        self._stats["cached_tokens"] += call_cached_tokens
+
+        call_hit_rate = call_cached_tokens / call_prompt_tokens if call_prompt_tokens else 0.0
+        total_stats = self.get_stats()
+        print(
+            "[SGL Agent] "
+            f"{self._agent_name}: "
+            f"prompt={call_prompt_tokens}, completion={call_completion_tokens}, "
+            f"cached={call_cached_tokens}, cache_hit_rate={call_hit_rate:.2%} | "
+            "accumulated: "
+            f"prompt={total_stats['prompt_tokens']}, "
+            f"completion={total_stats['completion_tokens']}, "
+            f"cached={total_stats['cached_tokens']}, "
+            f"cache_hit_rate={total_stats['cache_hit_rate']:.2%}"
+        )
+
+    def __getattr__(self, name):
+        attr = getattr(self._instance, name)
+        if not callable(attr):
+            return attr
+
+        def _wrap_iterable(ret):
+            for item in ret:
+                self._maybe_update_stats(item)
+                yield item
+
+        if inspect.iscoroutinefunction(attr):
+
+            async def async_wrapped(*args, **kwargs):
+                ret = await attr(*args, **kwargs)
+                self._maybe_update_stats(ret)
+                return ret
+
+            return async_wrapped
+
+        def wrapped(*args, **kwargs):
+            ret = attr(*args, **kwargs)
+            if inspect.isgenerator(ret):
+                return _wrap_iterable(ret)
+            self._maybe_update_stats(ret)
+            return ret
+
+        return wrapped
 
 
 class SglFunction:

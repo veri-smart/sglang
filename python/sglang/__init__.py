@@ -5,6 +5,7 @@ from sglang.global_config import global_config
 from sglang.lang.api import (
     Engine,
     Runtime,
+    agent,
     assistant,
     assistant_begin,
     assistant_end,
@@ -49,6 +50,7 @@ Engine = LazyImport("sglang.srt.entrypoints.engine", "Engine")
 __all__ = [
     "Engine",
     "Runtime",
+    "agent",
     "assistant",
     "assistant_begin",
     "assistant_end",
