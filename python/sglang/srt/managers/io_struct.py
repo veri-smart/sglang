@@ -176,6 +176,8 @@ class GenerateReqInput(BaseReq):
     log_metrics: bool = True
     # Whether to return hidden states
     return_hidden_states: Union[List[bool], bool] = False
+    # For agent id
+    agent_id: Optional[Union[List[str], str]] = None
     # For request type
     r_type: Optional[Union[Req_type, List[Req_type]]] = None
     # For prefetched rid
@@ -334,10 +336,6 @@ class GenerateReqInput(BaseReq):
         """Normalize inputs for a single example."""
         if self.sampling_params is None:
             self.sampling_params = {}
-        if self.r_type is Req_type.REQUEST:
-            self.rid = None 
-        if self.r_type is Req_type.RESAMPLE:
-            assert self.rid != None
         if self.r_type is Req_type.PREFETCH:
             assert self.p_rid != None
         if self.rid is None:
@@ -714,6 +712,9 @@ class TokenizedGenerateReqInput(BaseReq):
     
     # prefecth rid
     p_rid: str = None
+    
+    # mark an unique agent
+    agent_id: str = None
 
 
 @dataclass

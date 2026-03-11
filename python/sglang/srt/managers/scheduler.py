@@ -149,6 +149,9 @@ from sglang.srt.managers.scheduler_runtime_checker_mixin import (
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
+from sglang.srt.managers.scheduler_agent_controller import (
+	SglAgentPool,
+)
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -592,6 +595,7 @@ class Scheduler(
                 (ContinueGenerationReqInput, self.continue_generation),
             ]
         )
+        self.init_agent_scheduler(server_args)
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
@@ -931,6 +935,13 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+
+    def init_agent_scheduler(self, server_args: ServerArgs):
+        if server_args.agent_server_addr:
+           self.agent_pool = SglAgentPool(server_args.agent_server_addr,
+                                          self.gpu_id,
+                                          self.req_to_token_pool)
+
 
     def init_overlap(self):
         self.future_map = None
@@ -1326,7 +1337,8 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 r_type=recv_req.r_type,
-                p_rid=recv_req.p_rid
+                p_rid=recv_req.p_rid,
+                agent_id=recv_req.agent_id,
             )
             req.tokenizer = self.tokenizer
 
@@ -1784,7 +1796,8 @@ class Scheduler(
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
-        cached_decode_batch = []
+        cached_ongoing_decode_batch = []
+        cached_eos_decode_batch = []
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
 
@@ -1817,11 +1830,14 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
             
-            # if self.logits_recorder.enable_logits_cache:
+            
             if req.logits_cached:
-                match_result = self.logits_recorder.get_logits_cache(req)
+                match_result, eos_hint = self.logits_recorder.get_logits_cache(req)
                 if match_result:
-                    cached_decode_batch.append(req)
+                    if eos_hint:
+                        cached_eos_decode_batch.append(req)
+                    else:
+                        cached_ongoing_decode_batch.append(req)
                     continue
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
@@ -1841,10 +1857,17 @@ class Scheduler(
                         self.running_batch.batch_is_full = True
                 break
 
+        #TODO need handle eos batch
+        if len(cached_eos_decode_batch) > 0:
+            ...
+            GenerationBatchResult(
+                logits_output=logits_output,
+                can_run_cuda_graph=False,
+            )
         # update decode batch
-        if len(cached_decode_batch) > 0:
+        if len(cached_ongoing_decode_batch) > 0:
             decode_batch = ScheduleBatch.init_new(
-               cached_decode_batch,
+               cached_ongoing_decode_batch,
                self.req_to_token_pool,
                self.token_to_kv_pool_allocator,
                self.tree_cache,
@@ -1855,7 +1878,7 @@ class Scheduler(
                enable_logits_cache=True,
             )
             decode_batch.prepare_for_cached_decode()
-            self.waiting_queue = [x for x in self.waiting_queue if x not in cached_decode_batch]
+            self.waiting_queue = [x for x in self.waiting_queue if x not in cached_ongoing_decode_batch]
             if self.last_batch is None:
                 # preserve safety
                 self.last_batch = decode_batch

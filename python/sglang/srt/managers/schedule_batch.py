@@ -490,6 +490,7 @@ class Req:
         http_worker_ipc: Optional[str] = None,
         r_type: Req_type = None,
         p_rid: str = None,
+        agent_id: str = None,
     ):
         # Input and output info
         self.rid = rid
@@ -719,6 +720,8 @@ class Req:
         # For Logits Cache
         self.r_type = r_type
         self.p_rid = p_rid
+        # For Agentic
+        self.agent_id = agent_id
         # For diffusion LLM
         self.dllm_ids = []
         self.dllm_block_offset = 0

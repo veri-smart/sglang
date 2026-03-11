@@ -204,12 +204,13 @@ class LogitsRecord:
             self.consumer_queue[req.rid].put((output_tok, output_kv))
             e.set()
 
-    def get_logits_cache(self, req: Req) -> bool:
+    def get_logits_cache(self, req: Req) -> Tuple[bool, bool]:
         if req.rid not in self.req_info:
-            return False
+            return False, False
         self.event_pool[req.rid].wait()
         req_info = self.req_info[req.rid]
         con_q = self.consumer_queue[req.rid]
+        eos_set = req.eos_token_ids
         try:
             output_tok, output_kv = con_q.get_nowait()
         except Empty:
@@ -250,7 +251,7 @@ class LogitsRecord:
         req.cache_protected_len = len(req.fill_ids) - 1
 
         self.req_already_loaded.add(req.rid)
-        return True
+        return True, output_tok[-1] in eos_set
 
     def log_cache_info(self, req: Req, cached_tok: int):
         msg = f"Request {req.rid}, #cached-token: {cached_tok}"
@@ -629,7 +630,7 @@ class LogitsCache(BasePrefixCache):
         child_key = child_key.item()
         output_tok: List[int] = [child_key]
         output_kv: List[int] = []
-        eos_set = set(req.eos_token_ids)
+        eos_set = req.eos_token_ids
         should_exit = False
         _device = node._device
 
@@ -678,10 +679,9 @@ class LogitsCache(BasePrefixCache):
 
         output_tok: List[int] = []
         output_kv: List[int] = []
-        eos_set = set(req.eos_token_ids)
+        eos_set = req.eos_token_ids
         should_exit = False
         _device = node._device
-        spot_node_index = list(iter(self._spot_index_to_node.keys()))
 
         def get_child_key(node: TreeNode) -> int:
             if node in self._spot_node_to_offset:

@@ -894,6 +894,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 p_rid=obj.p_rid,
+                agent_id=obj.agent_id,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

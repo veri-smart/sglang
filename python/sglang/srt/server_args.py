@@ -596,6 +596,9 @@ class ServerArgs:
 
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
+    
+    # For Agent Server
+    agent_server_addr: Optional[str] = None
 
     def __post_init__(self):
         """
@@ -3965,6 +3968,13 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+        
+        # For agent server
+        parser.add_argument(
+            "--agent-server-addr",
+            type=str,
+            help="The address of the agent server.",
         )
 
     @classmethod

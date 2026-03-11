@@ -372,6 +372,7 @@ class SchedulerOutputProcessorMixin:
                       self.logits_recorder.update_req(req, history_logits)
                     release_kv_cache(req, self.tree_cache, is_complete=req.should_cache)
                     
+                self.agent_pool.collect_agent_usage(req, req.agent_id)
                 req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():

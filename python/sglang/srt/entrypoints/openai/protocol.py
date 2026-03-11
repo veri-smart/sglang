@@ -530,6 +530,8 @@ class ChatCompletionRequest(BaseModel):
     rid: Optional[Union[List[str], str]] = None
     # For request type
     r_type: Optional[Union[List[Req_type], Req_type]] = None
+    # For agent id
+    agent_id: Optional[Union[List[str], str]] = None
     # For prefetched rid
     p_rid: Optional[Union[List[str], str]] = None
     # Extra key for classifying the request (e.g. cache_salt)
