@@ -938,9 +938,17 @@ class Scheduler(
 
     def init_agent_scheduler(self, server_args: ServerArgs):
         if server_args.agent_server_addr:
-           self.agent_pool = SglAgentPool(server_args.agent_server_addr,
-                                          self.gpu_id,
-                                          self.req_to_token_pool)
+            is_rank0 = (
+                self.tp_rank == 0
+                and self.pp_rank == 0
+                and (self.dp_rank is None or self.dp_rank == 0)
+            )
+            self.agent_pool = SglAgentPool(
+                server_args.agent_server_addr,
+                self.gpu_id,
+                self.req_to_token_pool,
+                start_register_server=is_rank0,
+            )
 
 
     def init_overlap(self):
