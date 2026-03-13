@@ -1,11 +1,9 @@
 from __future__ import annotations
 import asyncio
 import threading
-import weakref
 from collections import defaultdict
 from typing import Any, Dict, NewType, Optional
 from aiohttp import web
-import requests
 from dataclasses import dataclass
 import logging
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -146,7 +144,6 @@ class SglAgentPool:
                     alloced[AGENT_ID(agent_id)]
                 )
 
-
     @classmethod
     def _normalize_agent_metadata(
         cls,
@@ -162,16 +159,6 @@ class SglAgentPool:
     @property
     def total_budget(self):
         return sum(self.device_budget.values())
-
-    @classmethod
-    def register(cls, agent: Any) -> str:
-        agent_uuid, metadata = cls._normalize_agent_metadata(agent=agent)
-        with cls._lock:
-            cls._agents[AGENT_ID(agent_uuid)] = metadata
-            # allocate budget online
-            cls._rebalance_budget_locked()
-
-        return agent_uuid
 
     @classmethod
     def register_agent(
@@ -228,69 +215,6 @@ class SglAgentPool:
                 self.batch_size = 0
 
 
-class SglAgent:
-    def __init__(self, agent):
-        self.agent_cls = agent
-
-    def __call__(self, *args, **kwargs):
-        instance = self.agent_cls(*args, **kwargs)
-        agent_id = getattr(instance, "id", None)
-        assert agent_id is not None, "Agent must have an ID"
-
-        rpc_endpoint = getattr(instance, "rpc_endpoint", None)
-        if rpc_endpoint is None:
-            return instance
-
-        if self.register(rpc_endpoint, agent_id):
-            weakref.finalize(
-                instance,
-                self._safe_unregister,
-                str(rpc_endpoint),
-                str(agent_id),
-            )
-        return instance
-
-    @staticmethod
-    def _safe_unregister(server_addr: str, agent_id: str):
-        try:
-            response = requests.delete(
-                f"{server_addr}/unregister",
-                json={"agent_id": str(agent_id)},
-                timeout=5,
-            )
-            if response.status_code == 200:
-                logger.info(f"Successfully unregistered agent {agent_id}")
-            else:
-                logger.warning(
-                    f"Failed to unregister agent {agent_id}: {response.status_code}, {response.text}"
-                )
-        except Exception as e:
-            logger.warning(
-                f"Skip unregister agent {agent_id}: registry server {server_addr} unavailable ({e})"
-            )
-
-    def register(self, server_addr: str, agent_id: str, metadata: Optional[Dict[str, Any]] = None):
-        try:
-            response = requests.put(
-                f"{server_addr}/register",
-                json={"agent_id": str(agent_id), "metadata": metadata},
-                timeout=5,
-            )
-            if response.status_code == 200:
-                logger.info(f"Successfully registered agent {agent_id}")
-                return True
-            else:
-                logger.warning(
-                    f"Failed to register agent {agent_id}: {response.status_code}, {response.text}"
-                )
-                return False
-        except Exception as e:
-            logger.warning(
-                f"Skip register agent {agent_id}: registry server {server_addr} unavailable ({e})"
-            )
-            return False
-
-
 class SglAgentRegisterServer:
     def __init__(self, host: str, port: int):
         self.host = host
@@ -302,41 +226,29 @@ class SglAgentRegisterServer:
         self.thread.start()
 
     def init_server(self):
-        self.app.router.add_route("*", "/register", self.register_agent)
-        self.app.router.add_route("*", "/unregister", self.unregister_agent)
+        self.app.router.add_put("/register", self.register_agent)
+        self.app.router.add_put("/unregister", self.unregister_agent)
 
     async def register_agent(self, request: web.Request):
-        method = request.method
-        if method == "PUT":
-            data = await request.json()
-            agent_id = data.get("agent_id")
-            metadata = data.get("metadata")
-            SglAgentPool.register_agent(agent_id, metadata)
-            return web.Response(
-                text=f"success",
-                status=200,
-                content_type="application/json",
-            )
-        else:
-            return web.Response(
-                text="Method not allowed", status=405, content_type="application/json"
-            )
+        data = await request.json()
+        agent_id = data.get("agent_id")
+        metadata = data.get("metadata")
+        SglAgentPool.register_agent(agent_id, metadata)
+        return web.Response(
+            text=f"success",
+            status=200,
+            content_type="application/json",
+        )
 
     async def unregister_agent(self, request: web.Request):
-        method = request.method
-        if method == "DELETE":
-            data = await request.json()
-            agent_id = data.get("agent_id")
-            SglAgentPool.unregister_agent(agent_id)
-            return web.Response(
-                text=f"success",
-                status=200,
-                content_type="application/json",
-            )
-        else:
-            return web.Response(
-                text="Method not allowed", status=405, content_type="application/json"
-            )
+        data = await request.json()
+        agent_id = data.get("agent_id")
+        SglAgentPool.unregister_agent(agent_id)
+        return web.Response(
+            text=f"success",
+            status=200,
+            content_type="application/json",
+        )
 
     def _run_server(self):
         try:
