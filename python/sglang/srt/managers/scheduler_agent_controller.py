@@ -22,18 +22,21 @@ class PriorityScore:
     output_toks: int
     agent_called_times: int
     logits_cached_toks: int
+    evict_times: int
 
     def __init__(self,
                  cached_toks: int = 0,
                  input_toks: int = 0,
                  output_toks: int = 0,
                  agent_called_times: int = 0,
-                 logits_cached_toks: int = 0):
+                 logits_cached_toks: int = 0,
+                 evict_times: int = 0):
         self.cached_toks = cached_toks
         self.input_toks = input_toks
         self.output_toks = output_toks
         self.agent_called_times = agent_called_times
         self.logits_cached_toks = logits_cached_toks
+        self.evict_times = evict_times
 
     def __add__(self, other: PriorityScore) -> PriorityScore:
         return PriorityScore(
@@ -42,6 +45,7 @@ class PriorityScore:
             output_toks=self.output_toks + other.output_toks,
             agent_called_times=self.agent_called_times + other.agent_called_times,
             logits_cached_toks=self.logits_cached_toks + other.logits_cached_toks,
+            evict_times=self.evict_times + other.evict_times,
         )
 
     @property
@@ -55,17 +59,17 @@ class PriorityScore:
             self.cached_toks * cached_toks_weight +
             self.input_toks * input_toks_weight +
             self.output_toks * output_toks_weight +
-            self.logits_cached_toks * logits_cached_toks_weight
+            self.logits_cached_toks * logits_cached_toks_weight +
+            self.evict_times
         )
+
 
 class SglAgentPool:
     _lock = threading.Lock()
     _agents: Dict[AGENT_ID, Dict[str, Any]] = {}
 
-    # record each agent instance's GPU budget
-    agent_budget: Dict[AGENT_ID, Dict[GPU_ID, PAGE_NUM]] = {}
-    # record each GPU's remain page size
-    device_budget: Dict[GPU_ID, PAGE_NUM] = {}
+    # record each agent instance's page budget
+    agent_budget: Dict[AGENT_ID, PAGE_NUM] = {}
     # record each agent instance score, which will be caculated to update importance score
     agent_score: Dict[AGENT_ID, PriorityScore] = defaultdict(PriorityScore)
 
@@ -75,7 +79,6 @@ class SglAgentPool:
     def __init__(
         self,
         server_addr: str,
-        gpu_id: int,
         req_to_token_pool: ReqToTokenPool,
         start_register_server: bool = True,
     ):
@@ -83,112 +86,106 @@ class SglAgentPool:
         self.register_server = None
         if start_register_server:
             self.register_server = SglAgentRegisterServer(
-                host=host, port=int(port)
+                host=host, port=int(port), agent_pool=self
             )
         self.req_to_token_pool = req_to_token_pool
+        self._total_budget = req_to_token_pool.size
+        self.init_default()
 
-        with self._lock:
-            self.device_budget[gpu_id] = req_to_token_pool.size
+    def init_default(self):
+        if len(self._agents) > 0:
+            return
+        self.register_agent("default")
 
-    @classmethod
-    def _rebalance_budget_locked(cls):
-        agent_ids = list(cls._agents.keys())
+    def _rebalance_budget_locked(self):
+        agent_ids = list(self._agents.keys())
         agent_cnt = len(agent_ids)
         if agent_cnt == 0:
-            cls.agent_budget.clear()
+            self.agent_budget.clear()
             return
 
         raw_scores = {
-            AGENT_ID(agent_id): cls.agent_score[AGENT_ID(agent_id)].score
+            agent_id: self.agent_score[agent_id].score
             for agent_id in agent_ids
         }
         total_score = sum(raw_scores.values())
 
         if total_score > 0:
             weights = {
-                AGENT_ID(agent_id): raw_scores[AGENT_ID(agent_id)] / total_score
+                agent_id: raw_scores[agent_id] / total_score
                 for agent_id in agent_ids
             }
         else:
             weights = {
-                AGENT_ID(agent_id): 1.0 / agent_cnt
+                agent_id: 1.0 / agent_cnt
                 for agent_id in agent_ids
             }
 
-        cls.agent_budget = {AGENT_ID(agent_id): {} for agent_id in agent_ids}
-        for gpu_id, total_mem in cls.device_budget.items():
-            alloced = {
-                AGENT_ID(agent_id): int(total_mem * weights[AGENT_ID(agent_id)])
-                for agent_id in agent_ids
-            }
-            exact_alloc = {
-                AGENT_ID(agent_id): total_mem * weights[AGENT_ID(agent_id)]
-                for agent_id in agent_ids
-            }
-            remainder = total_mem - sum(alloced.values())
-            if remainder > 0:
-                ordered = sorted(
-                    agent_ids,
-                    key=lambda aid: (
-                        exact_alloc[AGENT_ID(aid)] - alloced[AGENT_ID(aid)],
-                        str(aid),
-                    ),
-                    reverse=True,
-                )
-                for i in range(remainder):
-                    chosen = AGENT_ID(ordered[i % agent_cnt])
-                    alloced[chosen] += 1
+        alloced = {
+            agent_id: int(self._total_budget * weights[agent_id])
+            for agent_id in agent_ids
+        }
+        exact_alloc = {
+            agent_id: self._total_budget * weights[agent_id]
+            for agent_id in agent_ids
+        }
 
-            for agent_id in agent_ids:
-                cls.agent_budget[AGENT_ID(agent_id)][GPU_ID(gpu_id)] = PAGE_NUM(
-                    alloced[AGENT_ID(agent_id)]
-                )
+        remainder = self._total_budget - sum(alloced.values())
+        if remainder > 0:
+            ordered = sorted(
+                agent_ids,
+                key=lambda aid: (
+                    exact_alloc[aid] - alloced[aid],
+                    str(aid),
+                ),
+                reverse=True,
+            )
+            for i in range(remainder):
+                chosen = ordered[i % agent_cnt]
+                alloced[chosen] += 1
 
-    @classmethod
+        self.agent_budget = {
+            agent_id: PAGE_NUM(alloced[agent_id])
+            for agent_id in agent_ids
+        }
+
     def _normalize_agent_metadata(
-        cls,
+        self,
         agent_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, Dict[str, Any]]:
         assert agent_id is not None, "Agent must have an ID"
 
         normalized_agent_id = str(agent_id)
-        normalized_metadata = dict(metadata or {})
+        normalized_metadata = metadata if metadata else {}
         return normalized_agent_id, normalized_metadata
 
-    @property
-    def total_budget(self):
-        return sum(self.device_budget.values())
-
-    @classmethod
     def register_agent(
-        cls,
+        self,
         agent_id: str,
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        normalized_agent_id, normalized_metadata = cls._normalize_agent_metadata(
+        normalized_agent_id, normalized_metadata = self._normalize_agent_metadata(
             agent_id=agent_id,
             metadata=metadata,
         )
-        with cls._lock:
-            cls._agents[AGENT_ID(normalized_agent_id)] = normalized_metadata
-            cls._rebalance_budget_locked()
+        with self._lock:
+            self._agents[AGENT_ID(normalized_agent_id)] = normalized_metadata
+            self._rebalance_budget_locked()
         logger.info(
             f"Registered agent {normalized_agent_id} with metadata {normalized_metadata}")
 
-    @classmethod
-    def unregister_agent(cls, agent_id: str):
+    def unregister_agent(self, agent_id: str):
         normalized_agent_id = str(agent_id)
-        with cls._lock:
-            cls._agents.pop(AGENT_ID(normalized_agent_id), None)
-            cls.agent_score.pop(AGENT_ID(normalized_agent_id), None)
-            cls._rebalance_budget_locked()
+        with self._lock:
+            self._agents.pop(AGENT_ID(normalized_agent_id), None)
+            self.agent_score.pop(AGENT_ID(normalized_agent_id), None)
+            self._rebalance_budget_locked()
         logger.info(f"Unregistered agent {normalized_agent_id}")
 
-    @classmethod
-    def get(cls, agent_uuid: str):
-        with cls._lock:
-            return cls._agents.get(AGENT_ID(str(agent_uuid)))
+    def get(self, agent_uuid: str):
+        with self._lock:
+            return self._agents.get(AGENT_ID(str(agent_uuid)))
 
     def collect_agent_usage(self, req: Req, agent_uuid: Optional[str] = None):
         # TODO: add logits cache tokens
@@ -214,11 +211,17 @@ class SglAgentPool:
                 self.agent_score.clear()
                 self.batch_size = 0
 
+    def remain_budget(self, req: Req) -> int:
+        agent_id: str = req.agent_id if req.agent_id is not None else "default"
+        if agent_id not in self.agent_budget:
+            raise RuntimeError(f"Agent {agent_id} not found in budget")
+        return self.agent_budget[agent_id]
 
 class SglAgentRegisterServer:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, agent_pool: SglAgentPool):
         self.host = host
         self.port = port
+        self.agent_pool = agent_pool
         self.app = web.Application()
         self.init_server()
         # Start register server
@@ -233,7 +236,7 @@ class SglAgentRegisterServer:
         data = await request.json()
         agent_id = data.get("agent_id")
         metadata = data.get("metadata")
-        SglAgentPool.register_agent(agent_id, metadata)
+        self.agent_pool.register_agent(agent_id, metadata)
         return web.Response(
             text=f"success",
             status=200,
@@ -243,7 +246,7 @@ class SglAgentRegisterServer:
     async def unregister_agent(self, request: web.Request):
         data = await request.json()
         agent_id = data.get("agent_id")
-        SglAgentPool.unregister_agent(agent_id)
+        self.agent_pool.unregister_agent(agent_id)
         return web.Response(
             text=f"success",
             status=200,

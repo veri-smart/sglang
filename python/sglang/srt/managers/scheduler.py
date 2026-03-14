@@ -945,7 +945,6 @@ class Scheduler(
             )
             self.agent_pool = SglAgentPool(
                 server_args.agent_server_addr,
-                self.gpu_id,
                 self.req_to_token_pool,
                 start_register_server=is_rank0,
             )
@@ -1789,6 +1788,7 @@ class Scheduler(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
+            self.agent_pool,
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
