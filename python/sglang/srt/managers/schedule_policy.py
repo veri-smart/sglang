@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from sglang.srt.mem_cache.memory_pool import AgentReqToTokenPool
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -594,8 +596,11 @@ class PrefillAdder:
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
         
-        # if self.agent_req_allocator.remain_budget(req) < 1:
-        #     return AddReqResult.OTHER
+        # check agent budget info
+        token_pool = self.tree_cache.req_to_token_pool
+        if isinstance(token_pool, AgentReqToTokenPool):
+            if token_pool.remain_budget(req) < 1:
+                return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
