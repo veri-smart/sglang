@@ -82,6 +82,9 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.managers.scheduler_agent_controller import (
+    run_agent_register_server_process,
+)
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -802,6 +805,9 @@ def _launch_subprocesses(
     )
 
     scheduler_procs = []
+    agent_event_queues = []
+    agent_ack_queue = mp.Queue()
+    agent_receiver_ids = []
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -834,6 +840,10 @@ def _launch_subprocesses(
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
                 with maybe_reindex_device_id(gpu_id) as gpu_id:
+                    receiver_id = f"{pp_rank}_{tp_rank}"
+                    agent_event_queue = mp.Queue()
+                    agent_event_queues.append(agent_event_queue)
+                    agent_receiver_ids.append(receiver_id)
                     proc = mp.Process(
                         target=run_scheduler_process,
                         args=(
@@ -845,6 +855,9 @@ def _launch_subprocesses(
                             pp_rank,
                             None,
                             writer,
+                            agent_event_queue,
+                            agent_ack_queue,
+                            receiver_id,
                         ),
                     )
                     with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
@@ -864,6 +877,18 @@ def _launch_subprocesses(
         )
         proc.start()
         scheduler_procs.append(proc)
+
+    proc = mp.Process(
+        target=run_agent_register_server_process,
+        args=(
+            server_args.agent_server_addr,
+            agent_event_queues,
+            agent_ack_queue,
+            agent_receiver_ids,
+        ),
+    )
+    proc.start()
+    scheduler_procs.append(proc)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,

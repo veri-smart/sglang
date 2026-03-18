@@ -1,14 +1,13 @@
 from __future__ import annotations
 import asyncio
 import threading
-from collections import defaultdict
-from typing import Any, Dict, NewType, Optional
+import multiprocessing as mp
+import queue
+import uuid
+from typing import Any, Dict, List, NewType
 from aiohttp import web
-from dataclasses import dataclass
 import logging
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.managers.schedule_batch import Req
-
+from dataclasses import dataclass
 AGENT_ID = NewType("AGENT_ID", str)
 GPU_ID = NewType("GPU_ID", int)
 PAGE_NUM = NewType("PAGE_NUM", int)
@@ -24,13 +23,15 @@ class PriorityScore:
     logits_cached_toks: int
     evict_times: int
 
-    def __init__(self,
-                 cached_toks: int = 0,
-                 input_toks: int = 0,
-                 output_toks: int = 0,
-                 agent_called_times: int = 0,
-                 logits_cached_toks: int = 0,
-                 evict_times: int = 0):
+    def __init__(
+        self,
+        cached_toks: int = 0,
+        input_toks: int = 0,
+        output_toks: int = 0,
+        agent_called_times: int = 0,
+        logits_cached_toks: int = 0,
+        evict_times: int = 0,
+    ):
         self.cached_toks = cached_toks
         self.input_toks = input_toks
         self.output_toks = output_toks
@@ -50,207 +51,108 @@ class PriorityScore:
 
     @property
     def score(self) -> int:
-        # here we set stable weights for different token types to calculate the priority score
         cached_toks_weight = 5
         input_toks_weight = 3
         output_toks_weight = 2
         logits_cached_toks_weight = 2
         return (
-            self.cached_toks * cached_toks_weight +
-            self.input_toks * input_toks_weight +
-            self.output_toks * output_toks_weight +
-            self.logits_cached_toks * logits_cached_toks_weight +
-            self.evict_times
+            self.cached_toks * cached_toks_weight
+            + self.input_toks * input_toks_weight
+            + self.output_toks * output_toks_weight
+            + self.logits_cached_toks * logits_cached_toks_weight
+            + self.evict_times
         )
 
-
-class SglAgentPool:
-    _lock = threading.Lock()
-    _agents: Dict[AGENT_ID, Dict[str, Any]] = {}
-
-    # record each agent instance's page budget
-    agent_budget: Dict[AGENT_ID, PAGE_NUM] = {}
-    # record each agent instance score, which will be caculated to update importance score
-    agent_score: Dict[AGENT_ID, PriorityScore] = defaultdict(PriorityScore)
-
-    batch_size: int = 0
-    FLUSH_THRESHOLD = 2
-
-    def __init__(
-        self,
-        server_addr: str,
-        req_to_token_pool: ReqToTokenPool,
-        start_register_server: bool = True,
-    ):
-        host, port = server_addr.split(":")
-        self.register_server = None
-        if start_register_server:
-            self.register_server = SglAgentRegisterServer(
-                host=host, port=int(port), agent_pool=self
-            )
-        self.req_to_token_pool = req_to_token_pool
-        self._total_budget = req_to_token_pool.size
-        self.init_default()
-
-    def init_default(self):
-        if len(self._agents) > 0:
-            return
-        self.register_agent("default")
-
-    def _rebalance_budget_locked(self):
-        agent_ids = list(self._agents.keys())
-        agent_cnt = len(agent_ids)
-        if agent_cnt == 0:
-            self.agent_budget.clear()
-            return
-
-        raw_scores = {
-            agent_id: self.agent_score[agent_id].score
-            for agent_id in agent_ids
-        }
-        total_score = sum(raw_scores.values())
-
-        if total_score > 0:
-            weights = {
-                agent_id: raw_scores[agent_id] / total_score
-                for agent_id in agent_ids
-            }
-        else:
-            weights = {
-                agent_id: 1.0 / agent_cnt
-                for agent_id in agent_ids
-            }
-
-        alloced = {
-            agent_id: int(self._total_budget * weights[agent_id])
-            for agent_id in agent_ids
-        }
-        exact_alloc = {
-            agent_id: self._total_budget * weights[agent_id]
-            for agent_id in agent_ids
-        }
-
-        remainder = self._total_budget - sum(alloced.values())
-        if remainder > 0:
-            ordered = sorted(
-                agent_ids,
-                key=lambda aid: (
-                    exact_alloc[aid] - alloced[aid],
-                    str(aid),
-                ),
-                reverse=True,
-            )
-            for i in range(remainder):
-                chosen = ordered[i % agent_cnt]
-                alloced[chosen] += 1
-
-        self.agent_budget = {
-            agent_id: PAGE_NUM(alloced[agent_id])
-            for agent_id in agent_ids
-        }
-
-    def _normalize_agent_metadata(
-        self,
-        agent_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> tuple[str, Dict[str, Any]]:
-        assert agent_id is not None, "Agent must have an ID"
-
-        normalized_agent_id = str(agent_id)
-        normalized_metadata = metadata if metadata else {}
-        return normalized_agent_id, normalized_metadata
-
-    def register_agent(
-        self,
-        agent_id: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ):
-        normalized_agent_id, normalized_metadata = self._normalize_agent_metadata(
-            agent_id=agent_id,
-            metadata=metadata,
-        )
-        with self._lock:
-            self._agents[AGENT_ID(normalized_agent_id)] = normalized_metadata
-            self._rebalance_budget_locked()
-        logger.info(
-            f"Registered agent {normalized_agent_id} with metadata {normalized_metadata}")
-
-    def unregister_agent(self, agent_id: str):
-        normalized_agent_id = str(agent_id)
-        with self._lock:
-            self._agents.pop(AGENT_ID(normalized_agent_id), None)
-            self.agent_score.pop(AGENT_ID(normalized_agent_id), None)
-            self._rebalance_budget_locked()
-        logger.info(f"Unregistered agent {normalized_agent_id}")
-
-    def get(self, agent_uuid: str):
-        with self._lock:
-            return self._agents.get(AGENT_ID(str(agent_uuid)))
-
-    def collect_agent_usage(self, req: Req, agent_uuid: Optional[str] = None):
-        # TODO: add logits cache tokens
-        if agent_uuid is None:
-            return
-
-        if agent_uuid not in self._agents:
-            logger.warning(
-                f"Agent {agent_uuid} not found in pool during usage collection")
-            return
-
-        self.agent_score[AGENT_ID(agent_uuid)] += PriorityScore(
-            cached_toks=len(req.prefix_indices),
-            input_toks=len(req.fill_ids)-len(req.prefix_indices),
-            output_toks=len(req.output_ids),
-            agent_called_times=1,
-            logits_cached_toks=0,
-        )
-        self.batch_size += 1
-        if self.batch_size >= self.FLUSH_THRESHOLD:
-            with self._lock:
-                self._rebalance_budget_locked()
-                self.agent_score.clear()
-                self.batch_size = 0
-
-    def remain_budget(self, req: Req) -> int:
-        agent_id: str = req.agent_id if req.agent_id is not None else "default"
-        if agent_id not in self.agent_budget:
-            raise RuntimeError(f"Agent {agent_id} not found in budget")
-        return self.agent_budget[agent_id]
 
 class SglAgentRegisterServer:
-    def __init__(self, host: str, port: int, agent_pool: SglAgentPool):
-        self.host = host
-        self.port = port
-        self.agent_pool = agent_pool
+    def __init__(
+        self,
+        agent_server_addr: str,
+        notify_queues: List[mp.Queue],
+        ack_queue: mp.Queue,
+        expected_receivers: List[int],
+    ):
+        self.host, self.port = agent_server_addr.split(":")
+        self.port = int(self.port)
         self.app = web.Application()
+        self.notify_queues = notify_queues or []
+        self.ack_queue = ack_queue
+        self.expected_receivers = expected_receivers
+        self._broadcast_lock = threading.Lock()
         self.init_server()
         # Start register server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.thread.start()
 
+    def _broadcast_event(self, event: Dict[str, Any]) -> tuple[str, bool, List[int]]:
+        event_id = uuid.uuid4().hex
+        event["event_id"] = event_id
+
+        with self._broadcast_lock:
+            for q in self.notify_queues:
+                q.put(event)
+
+            acked: set[int] = set()
+            while len(acked) < len(self.expected_receivers):
+                try:
+                    ack = self.ack_queue.get(timeout=30)
+                except queue.Empty:
+                    break
+
+                if ack.get("event_id") != event_id:
+                    continue
+                if ack.get("status") == "ok":
+                    receiver_id = ack.get("receiver_id")
+                    acked.add(receiver_id)
+
+            missing = [
+                rid for rid in self.expected_receivers if rid not in acked]
+            return event_id, len(missing) == 0, missing
+
     def init_server(self):
         self.app.router.add_put("/register", self.register_agent)
         self.app.router.add_put("/unregister", self.unregister_agent)
+        self.app.router.add_get("/heartbeat", self.heartbeat)
 
     async def register_agent(self, request: web.Request):
         data = await request.json()
         agent_id = data.get("agent_id")
         metadata = data.get("metadata")
-        self.agent_pool.register_agent(agent_id, metadata)
-        return web.Response(
-            text=f"success",
-            status=200,
-            content_type="application/json",
+        event_id, ok, missing = self._broadcast_event(
+            {"op": "register", "agent_id": agent_id, "metadata": metadata}
+        )
+        return web.json_response(
+            {
+                "status": "ok" if ok else "error",
+                "event_id": event_id,
+                "missing_receivers": missing,
+            },
+            status=200 if ok else 504,
         )
 
     async def unregister_agent(self, request: web.Request):
         data = await request.json()
         agent_id = data.get("agent_id")
-        self.agent_pool.unregister_agent(agent_id)
-        return web.Response(
-            text=f"success",
-            status=200,
-            content_type="application/json",
+        event_id, ok, missing = self._broadcast_event(
+            {"op": "unregister", "agent_id": agent_id}
+        )
+        return web.json_response(
+            {
+                "status": "ok" if ok else "error",
+                "event_id": event_id,
+                "missing_receivers": missing,
+            },
+            status=200 if ok else 504,
+        )
+
+    async def heartbeat(self, request: web.Request):
+        return web.json_response(
+            {
+                "status": "ok",
+                "host": self.host,
+                "port": self.port,
+                "slave_num": len(self.notify_queues),
+            }
         )
 
     def _run_server(self):
@@ -275,3 +177,18 @@ class SglAgentRegisterServer:
             # Cleanup
             self._loop.run_until_complete(self._runner.cleanup())
             self._loop.close()
+
+
+def run_agent_register_server_process(
+    agent_server_addr: str,
+    notify_queues: List[mp.Queue],
+    ack_queue: mp.Queue,
+    expected_receivers: List[int],
+):
+    server = SglAgentRegisterServer(
+        agent_server_addr,
+        notify_queues,
+        ack_queue,
+        expected_receivers,
+    )
+    server.thread.join()

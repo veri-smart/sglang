@@ -598,7 +598,8 @@ class ServerArgs:
     forward_hooks: Optional[List[dict[str, Any]]] = None
     
     # For Agent Server
-    agent_server_addr: Optional[str] = None
+    enable_agent_serving: bool = False
+    agent_server_addr: Optional[str] = "localhost:7878"
 
     def __post_init__(self):
         """
@@ -686,6 +687,9 @@ class ServerArgs:
 
         # Handle elastic expert parallelism.
         self._handle_elastic_ep()
+        
+        # Handle agentic serving mode
+        self._handle_agentic_serving()
 
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
@@ -1632,6 +1636,11 @@ class ServerArgs:
                 assert (
                     self.eplb_algorithm == "elasticity_aware"
                 ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
+
+    def _handle_agentic_serving(self):
+        if self.enable_agent_serving is False:
+            self.agent_server_addr = None
+            return
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -3971,6 +3980,11 @@ class ServerArgs:
         )
         
         # For agent server
+        parser.add_argument(
+            "--enable-agent-serving",
+            action="store_true",
+            help="Enable agent serving mode",
+        )
         parser.add_argument(
             "--agent-server-addr",
             type=str,

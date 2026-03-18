@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -213,6 +213,9 @@ class TpModelWorker(BaseTpWorker):
         pp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
+        agent_event_queue: Any,
+        agent_ack_queue: Any,
+        agent_receiver_id: str,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -258,6 +261,9 @@ class TpModelWorker(BaseTpWorker):
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            agent_event_queue=agent_event_queue,
+            agent_ack_queue=agent_ack_queue,
+            agent_receiver_id=agent_receiver_id,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None

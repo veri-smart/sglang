@@ -3,9 +3,7 @@ from __future__ import annotations
 import enum
 from sglang.srt.entrypoints.openai.protocol import Req_type
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.mem_cache.logits_cache import LogitsRecord
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

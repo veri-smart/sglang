@@ -11,11 +11,10 @@ from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool, AgentReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
-
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 
@@ -305,6 +304,8 @@ def alloc_req_slots(
                 mamba_num = max(0, num_reqs - mamba_available_size)
                 tree_cache.evict_mamba(mamba_num)
         req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
+    elif isinstance(req_to_token_pool, AgentReqToTokenPool):
+        req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs=reqs)
     else:
         req_pool_indices = req_to_token_pool.alloc(num_reqs)
 

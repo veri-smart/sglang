@@ -22,7 +22,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
-from sglang.srt.mem_cache.logits_cache import LogitsKey
+from sglang.srt.mem_cache.memory_pool import AgentReqToTokenPool
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         EmbeddingBatchResult,
@@ -371,8 +371,8 @@ class SchedulerOutputProcessorMixin:
                       history_logits, _ = self.logits_recorder.summary(req.rid)
                       self.logits_recorder.update_req(req, history_logits)
                     release_kv_cache(req, self.tree_cache, is_complete=req.should_cache)
-                    
-                self.agent_pool.collect_agent_usage(req, req.agent_id)
+                if isinstance(self.req_to_token_pool, AgentReqToTokenPool):    
+                    self.req_to_token_pool.collect_agent_usage(req, req.agent_id)
                 req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():

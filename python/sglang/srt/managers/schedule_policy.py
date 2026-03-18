@@ -31,9 +31,6 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.managers.scheduler_agent_controller import (
-	SglAgentPool,
-)
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
@@ -325,7 +322,6 @@ class PrefillAdder:
         page_size: int,
         tree_cache: BasePrefixCache,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        agent_req_allocator: SglAgentPool,
         running_batch: ScheduleBatch,
         new_token_ratio: float,
         rem_input_tokens: int,
@@ -372,7 +368,6 @@ class PrefillAdder:
         )
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         
-        self.agent_req_allocator = agent_req_allocator
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -599,8 +594,8 @@ class PrefillAdder:
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
         
-        if self.agent_req_allocator.remain_budget(req) < 1:
-            return AddReqResult.OTHER
+        # if self.agent_req_allocator.remain_budget(req) < 1:
+        #     return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition

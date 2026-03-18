@@ -149,9 +149,6 @@ from sglang.srt.managers.scheduler_runtime_checker_mixin import (
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
-from sglang.srt.managers.scheduler_agent_controller import (
-	SglAgentPool,
-)
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -234,6 +231,9 @@ class Scheduler(
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        agent_event_queue: Any,
+        agent_ack_queue: Any,
+        agent_receiver_id: str,
     ):
         # Parse args
         self.server_args = server_args
@@ -324,6 +324,9 @@ class Scheduler(
             pp_rank=pp_rank,
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
+            agent_event_queue=agent_event_queue,
+            agent_ack_queue=agent_ack_queue,
+            agent_receiver_id=agent_receiver_id,
         )
 
         # Launch a draft worker for speculative decoding
@@ -595,7 +598,6 @@ class Scheduler(
                 (ContinueGenerationReqInput, self.continue_generation),
             ]
         )
-        self.init_agent_scheduler(server_args)
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
@@ -936,18 +938,6 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
-    def init_agent_scheduler(self, server_args: ServerArgs):
-        if server_args.agent_server_addr:
-            is_rank0 = (
-                self.tp_rank == 0
-                and self.pp_rank == 0
-                and (self.dp_rank is None or self.dp_rank == 0)
-            )
-            self.agent_pool = SglAgentPool(
-                server_args.agent_server_addr,
-                self.req_to_token_pool,
-                start_register_server=is_rank0,
-            )
 
 
     def init_overlap(self):
@@ -1788,7 +1778,6 @@ class Scheduler(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
-            self.agent_pool,
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
@@ -2683,6 +2672,9 @@ def run_scheduler_process(
     pp_rank: int,
     dp_rank: Optional[int],
     pipe_writer,
+    agent_event_queue: Any,
+    agent_ack_queue: Any,
+    agent_receiver_id: str,
 ):
     # Generate the logger prefix
     prefix = ""
@@ -2738,6 +2730,9 @@ def run_scheduler_process(
             moe_ep_rank,
             pp_rank,
             dp_rank,
+            agent_event_queue,
+            agent_ack_queue,
+            agent_receiver_id,
         )
         pipe_writer.send(
             {

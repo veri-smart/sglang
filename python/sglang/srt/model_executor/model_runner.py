@@ -24,7 +24,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union, Any
 
 import torch
 import torch.distributed as dist
@@ -115,6 +115,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
     ReqToTokenPool,
+    AgentReqToTokenPool,
     SWAKVPool,
 )
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -280,6 +281,9 @@ class ModelRunner:
         pp_size: int,
         nccl_port: int,
         server_args: ServerArgs,
+        agent_event_queue: Any,
+        agent_ack_queue: Any,
+        agent_receiver_id: str,
         dp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
@@ -316,6 +320,9 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
         self.init_new_workspace = False
+        self.agent_event_queue = agent_event_queue
+        self.agent_ack_queue = agent_ack_queue
+        self.agent_receiver_id = agent_receiver_id
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -1792,13 +1799,25 @@ class ModelRunner:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
-                self.req_to_token_pool = ReqToTokenPool(
-                    size=max_num_reqs,
-                    max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                )
+                if self.server_args.enable_agent_serving:
+                    self.req_to_token_pool = AgentReqToTokenPool(
+						size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        agent_event_queue=self.agent_event_queue,
+						agent_ack_queue=self.agent_ack_queue,
+						agent_receiver_id=self.agent_receiver_id,
+					)
+                else:
+                    self.req_to_token_pool = ReqToTokenPool(
+                        size=max_num_reqs,
+                        max_context_len=self.model_config.context_len
+                        + extra_max_context_len,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                    )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
