@@ -113,6 +113,7 @@ class SglAgentRegisterServer:
         self.app.router.add_put("/register", self.register_agent)
         self.app.router.add_put("/unregister", self.unregister_agent)
         self.app.router.add_get("/heartbeat", self.heartbeat)
+        self.app.router.add_get("/agent_info", self.get_agent_info)
 
     async def register_agent(self, request: web.Request):
         data = await request.json()
@@ -153,6 +154,17 @@ class SglAgentRegisterServer:
                 "port": self.port,
                 "slave_num": len(self.notify_queues),
             }
+        )
+
+    async def get_agent_info(self, request: web.Request):
+        event_id, ok, missing = self._broadcast_event({"op": "agent_info"})
+        return web.json_response(
+            {
+                "status": "ok" if ok else "error",
+                "event_id": event_id,
+                "missing_receivers": missing,
+            },
+            status=200 if ok else 504,
         )
 
     def _run_server(self):

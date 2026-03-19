@@ -239,7 +239,8 @@ class MambaPool:
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
                 )
             else:
-                self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
+                self.mamba_cache = self.State(
+                    conv=conv_state, temporal=temporal_state)
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
@@ -286,7 +287,8 @@ class MambaPool:
             self.mamba_cache.conv[i].zero_()
         self.mamba_cache.temporal.zero_()
 
-        self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
+        self.free_slots = torch.arange(
+            self.size, dtype=torch.int64, device=self.device)
 
     def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
@@ -319,7 +321,8 @@ class MambaPool:
             data_ptrs += [
                 state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
             ]
-            data_lens += [state_tensor[i].nbytes for i in range(self.num_mamba_layers)]
+            data_lens += [state_tensor[i]
+                          .nbytes for i in range(self.num_mamba_layers)]
             item_lens += [
                 state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
             ]
@@ -368,7 +371,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
-        self.mamba_map = {layer_id: i for i, layer_id in enumerate(cache_params.layers)}
+        self.mamba_map = {layer_id: i for i,
+                          layer_id in enumerate(cache_params.layers)}
 
         self.device = device
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
@@ -703,7 +707,7 @@ class MHATokenToKVPool(KVCache):
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
             for i in range(0, len(indices), chunk_size):
-                chunk_indices = indices[i : i + chunk_size]
+                chunk_indices = indices[i: i + chunk_size]
                 k_cpu = self.k_buffer[layer_id][chunk_indices].to(
                     "cpu", non_blocking=True
                 )
@@ -719,7 +723,7 @@ class MHATokenToKVPool(KVCache):
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
-                chunk_indices = indices[i : i + chunk_size]
+                chunk_indices = indices[i: i + chunk_size]
                 k_cpu, v_cpu = (
                     kv_cache_cpu[layer_id][i // chunk_size][0],
                     kv_cache_cpu[layer_id][i // chunk_size][1],
@@ -888,7 +892,8 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             cache_k_nope_fp4 = self.k_buffer[layer_id - self.start_layer].view(
                 torch.uint8
             )
-            cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id - self.start_layer]
+            cache_k_nope_fp4_sf = self.k_scale_buffer[layer_id -
+                                                      self.start_layer]
 
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
@@ -904,7 +909,8 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             cache_v_nope_fp4 = self.v_buffer[layer_id - self.start_layer].view(
                 torch.uint8
             )
-            cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id - self.start_layer]
+            cache_v_nope_fp4_sf = self.v_scale_buffer[layer_id -
+                                                      self.start_layer]
 
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
@@ -938,8 +944,10 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
-            cache_k, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
-            cache_v, cache_v_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_v)
+            cache_k, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
+                cache_k)
+            cache_v, cache_v_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
+                cache_v)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
@@ -954,18 +962,22 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.alt_stream.wait_stream(current_stream)
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
 
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
+            self.k_scale_buffer[layer_id -
+                                self.start_layer][loc] = cache_k_fp4_sf
             with self.device_module.stream(self.alt_stream):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
-                self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+                self.v_scale_buffer[layer_id -
+                                    self.start_layer][loc] = cache_v_fp4_sf
             current_stream.wait_stream(self.alt_stream)
         else:
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
-            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_fp4_sf
-            self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
+            self.k_scale_buffer[layer_id -
+                                self.start_layer][loc] = cache_k_fp4_sf
+            self.v_scale_buffer[layer_id -
+                                self.start_layer][loc] = cache_v_fp4_sf
 
 
 class HybridLinearKVPool(KVCache):
@@ -1142,7 +1154,8 @@ class HybridLinearKVPool(KVCache):
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
         with self._transfer_id_context(layer):
-            self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+            self.full_kv_pool.set_mla_kv_buffer(
+                layer, loc, cache_k_nope, cache_k_rope)
 
     def get_mla_kv_buffer(
         self,
@@ -1387,8 +1400,10 @@ class MLATokenToKVPool(KVCache):
     # for disagg
     def get_contiguous_buf_infos(self):
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
-        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        kv_data_ptrs = [self.kv_buffer[i].data_ptr()
+                        for i in range(self.layer_num)]
+        kv_data_lens = [
+            self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         kv_item_lens = [
             self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
         ]
@@ -1496,7 +1511,7 @@ class MLATokenToKVPool(KVCache):
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
             for i in range(0, len(indices), chunk_size):
-                chunk_indices = indices[i : i + chunk_size]
+                chunk_indices = indices[i: i + chunk_size]
                 kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
                     "cpu", non_blocking=True
                 )
@@ -1509,10 +1524,11 @@ class MLATokenToKVPool(KVCache):
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
-                chunk_indices = indices[i : i + chunk_size]
+                chunk_indices = indices[i: i + chunk_size]
                 kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
                 assert kv_cpu.shape[0] == len(chunk_indices)
-                kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
+                kv_chunk = kv_cpu.to(
+                    self.kv_buffer[0].device, non_blocking=True)
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         torch.cuda.synchronize()
 
@@ -1564,7 +1580,8 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(
                 torch.uint8
             )
-            cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id - self.start_layer]
+            cache_k_nope_fp4_sf = self.kv_scale_buffer[layer_id -
+                                                       self.start_layer]
 
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
@@ -1587,7 +1604,8 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         if cache_k.dtype != self.dtype:
             from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
 
-            cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
+            cache_k_fp4, cache_k_fp4_sf = KVFP4QuantizeUtil.batched_quantize(
+                cache_k)
 
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
@@ -2038,6 +2056,8 @@ class AgentReqToTokenPool(ReqToTokenPool):
                     self.register_agent(agent_id, metadata)
                 elif op == "unregister":
                     self.unregister_agent(agent_id)
+                elif op == "agent_info":
+                    self.log_agent_budget_info()
                 else:
                     raise RuntimeError(f"Unknown operation: {op}")
 
@@ -2058,6 +2078,23 @@ class AgentReqToTokenPool(ReqToTokenPool):
                     }
                 )
                 raise
+
+    def log_agent_budget_info(self):
+        with self._lock:
+            agent_ids = sorted(self._agents.keys(), key=str)
+            info = {
+                "receiver_id": self.agent_receiver_id,
+                "total_budget": self._total_budget,
+                "free_slots": len(self.free_slots),
+                "agents": {
+                    agent_id: {
+                        "remain_budget": len(self.agent_remain_budget.get(agent_id, [])),
+                        "allocated_budget": len(self.agent_alloca_budget.get(agent_id, [])),
+                    }
+                    for agent_id in agent_ids
+                },
+            }
+        logger.info("Agent budget info: %s", info)
 
     def register_agent(
         self,
