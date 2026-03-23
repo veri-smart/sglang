@@ -1854,7 +1854,7 @@ class Scheduler(
                         self.running_batch.batch_is_full = True
                 break
 
-        #TODO need handle eos batch
+        #TODO need check if reqs is finished
         if len(cached_eos_decode_batch) > 0:
             ...
             GenerationBatchResult(
@@ -1883,7 +1883,7 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch = self.last_batch
             else:
-                # Merge running_batch with prefill batch
+                # Merge running_batch with decode batch
                 self.running_batch.merge_batch(self.last_batch)
             return decode_batch
 

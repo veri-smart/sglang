@@ -371,7 +371,7 @@ class SchedulerOutputProcessorMixin:
                       history_logits, _ = self.logits_recorder.summary(req.rid)
                       self.logits_recorder.update_req(req, history_logits)
                     release_kv_cache(req, self.tree_cache, is_complete=req.should_cache)
-                if isinstance(self.req_to_token_pool, AgentReqToTokenPool):    
+                if isinstance(self.req_to_token_pool, AgentReqToTokenPool):
                     self.req_to_token_pool.collect_agent_usage(req, req.agent_id)
                 req.time_stats.completion_time = time.perf_counter()
 

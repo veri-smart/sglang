@@ -16,12 +16,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PriorityScore:
-    cached_toks: int
-    input_toks: int
-    output_toks: int
+    cached_toks: int  # req kv cached toks
+    input_toks: int   # req inputs toks (排除了 cached toks)
+    output_toks: int  # req output toks
     agent_called_times: int
-    logits_cached_toks: int
-    evict_times: int
+    logits_allocated_toks: int
+    logits_hit_toks: int
+    evict_times: int 
 
     def __init__(
         self,
@@ -29,14 +30,16 @@ class PriorityScore:
         input_toks: int = 0,
         output_toks: int = 0,
         agent_called_times: int = 0,
-        logits_cached_toks: int = 0,
+        logits_allocated_toks: int = 0,
+        logits_hit_toks: int = 0,
         evict_times: int = 0,
     ):
         self.cached_toks = cached_toks
         self.input_toks = input_toks
         self.output_toks = output_toks
         self.agent_called_times = agent_called_times
-        self.logits_cached_toks = logits_cached_toks
+        self.logits_allocated_toks = logits_allocated_toks
+        self.logits_hit_toks = logits_hit_toks
         self.evict_times = evict_times
 
     def __add__(self, other: PriorityScore) -> PriorityScore:
@@ -45,23 +48,37 @@ class PriorityScore:
             input_toks=self.input_toks + other.input_toks,
             output_toks=self.output_toks + other.output_toks,
             agent_called_times=self.agent_called_times + other.agent_called_times,
-            logits_cached_toks=self.logits_cached_toks + other.logits_cached_toks,
+            logits_allocated_toks=self.logits_allocated_toks + other.logits_allocated_toks,
+            logits_hit_toks=self.logits_hit_toks + other.logits_hit_toks,
             evict_times=self.evict_times + other.evict_times,
         )
 
     @property
-    def score(self) -> int:
-        cached_toks_weight = 5
-        input_toks_weight = 3
-        output_toks_weight = 2
-        logits_cached_toks_weight = 2
-        return (
+    def logits_wasted_ratio(self) -> float:
+        if self.logits_hit_toks == 0:
+            return 0.0
+        return self.logits_allocated_toks / self.logits_hit_toks
+
+
+    @property
+    def score(self) -> float:
+        # Higher score => higher scheduling priority / larger target budget.
+        cached_toks_weight = 5.0
+        input_toks_weight = 3.0
+        output_toks_weight = 2.0
+        called_times_weight = 1.0
+        logits_weight = 4.0
+        evict_times_weight = 8.0
+
+        _score = (
             self.cached_toks * cached_toks_weight
             + self.input_toks * input_toks_weight
             + self.output_toks * output_toks_weight
-            + self.logits_cached_toks * logits_cached_toks_weight
-            + self.evict_times
+            + self.agent_called_times * called_times_weight
+            - self.logits_wasted_ratio * logits_weight
+            + self.evict_times * evict_times_weight
         )
+        return _score
 
 
 class SglAgentRegisterServer:
@@ -95,7 +112,7 @@ class SglAgentRegisterServer:
             acked: set[int] = set()
             while len(acked) < len(self.expected_receivers):
                 try:
-                    ack = self.ack_queue.get(timeout=30)
+                    ack = self.ack_queue.get(timeout=30000)
                 except queue.Empty:
                     break
 

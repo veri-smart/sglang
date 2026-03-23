@@ -336,8 +336,14 @@ class GenerateReqInput(BaseReq):
         """Normalize inputs for a single example."""
         if self.sampling_params is None:
             self.sampling_params = {}
+        if self.r_type is Req_type.REQUEST:
+            self.rid = None 
+        if self.r_type is Req_type.RESAMPLE:
+            if self.rid is None:
+                raise ValueError("RESAMPLE requires `rid` to be set")
         if self.r_type is Req_type.PREFETCH:
-            assert self.p_rid != None
+            if self.p_rid is None or self.rid is None:
+                raise ValueError("PREFETCH requires both `p_rid` and `rid` to be set")
         if self.rid is None:
             self.rid = uuid.uuid4().hex
         if self.return_logprob is None:

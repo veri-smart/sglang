@@ -718,6 +718,8 @@ class Req:
         # For Logits Cache
         self.r_type = r_type
         self.p_rid = p_rid
+        self.logits_cache_budget: int = 0
+        self.logits_cache_hit: int = 0
         # For Agentic
         self.agent_id = agent_id
         # For diffusion LLM
@@ -751,7 +753,13 @@ class Req:
 
     @property
     def should_cache(self) -> bool:
-        return self.r_type == Req_type.REQUEST
+        return self.r_type in (Req_type.RESAMPLE, Req_type.PREFETCH, Req_type.REQUEST)
+
+    @property
+    def logits_usage(self) -> float:
+        if self.logits_cache_budget == 0:
+            return 0.0
+        return self.logits_cache_hit / self.logits_cache_budget
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""

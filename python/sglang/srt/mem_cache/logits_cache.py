@@ -15,7 +15,6 @@ import torch
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
-    BlockStored,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.evict_policy import (
@@ -26,7 +25,7 @@ from sglang.srt.mem_cache.evict_policy import (
     LRUStrategy,
     MRUStrategy,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, AgentReqToTokenPool
 from sglang.srt.server_args import get_global_server_args, ServerArgs
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.configs.model_config import ModelConfig
@@ -167,8 +166,8 @@ class LogitsRecord:
         ]
         cache_tree = self.logits_cache[req.rid]
         ind = self.select_topk_logits(history_logits, top_k=5)
-        cache_tree.insert(
-            LogitsKey(history_logits, logits_token_ids), kv_indice=kv_indices, spotNodes=ind)
+        hit_cnt = cache_tree.insert(LogitsKey(
+            history_logits, logits_token_ids), kv_indice=kv_indices, spotNodes=ind)
         cache_tree.init_time = time.monotonic()  # update timing
         # gen nxt logits
         self.producer_queue.put(req)
@@ -176,6 +175,10 @@ class LogitsRecord:
         self.req_logits_key.pop(req.rid)
         if req.rid in self.req_already_loaded:
             self.req_already_loaded.remove(req.rid)
+            
+        # update req's logits cache info
+        req.logits_cache_hit += hit_cnt
+        req.logits_cache_budget += len(logits_token_ids)
 
     def produce_nxt_logits(self):
         """
@@ -214,7 +217,7 @@ class LogitsRecord:
         try:
             output_tok, output_kv = con_q.get_nowait()
         except Empty:
-            return False
+            return False, False
 
         # Here we should first check if kv cache is still stored at radix tree
         if self.tree_cache is not None:
@@ -229,7 +232,7 @@ class LogitsRecord:
             )
             if len(token_ids) != match_result.device_indices.shape[0] + 1:
                 # cache hit miss
-                return False
+                return False, False
             self.log_cache_info(req, len(token_ids)-1)
             (
                 req.last_node,
@@ -339,6 +342,10 @@ class LogitsRecord:
         indices = torch.topk(weights, top_k).indices
         return indices.tolist()
 
+    def update_logits_cache_usage(self, req: Req):
+        if isinstance(self.req_to_token_pool, AgentReqToTokenPool):
+            ...
+
 
 @dataclass
 class LogitsKey:
@@ -434,13 +441,6 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-# def _check_extra_key(key0: LogitsKey, key1: LogitsKey):
-#     if key0.extra_key != key1.extra_key:
-#         raise ValueError(
-#             f"_key_match should be run on the same extra key, but got key0.extra_key={key0.extra_key} != key1.extra_key={key1.extra_key}"
-#         )
-
-
 def _key_match_page_size1(key0: LogitsKey, key1: LogitsKey):
     # _check_extra_key(key0, key1)
     i = 0
@@ -489,8 +489,10 @@ class LogitsCache(BasePrefixCache):
         self.kv_event_queue = []
         self.is_eagle = is_eagle
         # record spot index -> singleton treenode
-        self._spot_index_to_node: Dict[int, TreeNode] = {}  # each index map to spot tree node
-        self._spot_node_to_offset: DefaultDict[TreeNode, list[int]] = defaultdict(list)  # each node map to spot logits offset
+        # each index map to spot tree node
+        self._spot_index_to_node: Dict[int, TreeNode] = {}
+        self._spot_node_to_offset: DefaultDict[TreeNode, list[int]] = defaultdict(
+            list)  # each node map to spot logits offset
 
         if enable_metrics:
             self.init_metrics_collector()
@@ -654,7 +656,7 @@ class LogitsCache(BasePrefixCache):
                     should_exit = True
                     break
                 output_kv.append(kv_indices[idx])
-                
+
                 if nxt_id in eos_set:
                     should_exit = True
                     break
@@ -687,7 +689,8 @@ class LogitsCache(BasePrefixCache):
             if node in self._spot_node_to_offset:
                 ...
             else:
-                assert len(node.children)==1, "Non-spot node should have only one child"
+                assert len(
+                    node.children) == 1, "Non-spot node should have only one child"
                 return next(iter(node.children.keys()))
 
         child_key = get_child_key(node)
@@ -707,7 +710,7 @@ class LogitsCache(BasePrefixCache):
                 for off in offset:
                     output_tok.extend(logits_res[base_start:off])
                     output_kv.extend(kv_indices[base_start:off])
-                        
+
                     off_logit = LogitsProcessorOutput(
                         next_token_logits=child.key.logits[off:off + 1]
                     )
@@ -727,7 +730,6 @@ class LogitsCache(BasePrefixCache):
                 if should_exit:
                     break
                 child_key = nxt_id
-
 
         output_kv = [t.reshape(1) if t.ndim == 0 else t for t in output_kv]
         output_kv = torch.cat(output_kv, dim=0) if len(
@@ -857,37 +859,6 @@ class LogitsCache(BasePrefixCache):
 
     def _record_store_event(self, node: TreeNode):
         return
-        # One BlockStored per ``page_size`` chunk.
-        if self.enable_kv_cache_events:
-            # First chunk links to the last page of the parent node (if any).
-            if node.parent is None or node != self.root_node:
-                parent_block_hash = None
-            else:
-                last_page_start = (
-                    (len(node.parent.key) - 1) // self.page_size
-                ) * self.page_size
-                parent_parent_tokens = node.parent.key.token_ids[last_page_start:]
-                parent_block_hash = hash(tuple(parent_parent_tokens))
-
-            for start in range(0, len(node.key), self.page_size):
-                page_tokens = node.key.token_ids[start: start + self.page_size]
-                if not page_tokens:
-                    continue
-
-                block_hash = hash(tuple(page_tokens))
-
-                self.kv_event_queue.append(
-                    BlockStored(
-                        block_hashes=[block_hash],
-                        parent_block_hash=parent_block_hash,
-                        token_ids=page_tokens,
-                        block_size=len(page_tokens),
-                        lora_id=None,
-                    )
-                )
-
-                # Chain next chunk to this one.
-                parent_block_hash = block_hash
 
     def _record_remove_event(self, node: TreeNode):
         # One BlockRemoved per chunk.

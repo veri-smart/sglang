@@ -27,6 +27,7 @@ import triton.language as tl
 import triton
 import torch
 import numpy as np
+import math
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union, Any, NewType
 from contextlib import contextmanager, nullcontext
 import logging
@@ -1913,9 +1914,10 @@ class DoubleSparseTokenToKVPool(KVCache):
         self.v_buffer[layer_id - self.start_layer][loc] = cache_v
         self.label_buffer[layer_id - self.start_layer][loc] = cache_label
 
+
 class AgentReqToTokenPool(ReqToTokenPool):
     _lock = threading.Lock()
-    _agents: Dict[AGENT_ID, Dict[str, Any]] = {}
+    _agents: Dict[AGENT_ID, Dict[str, Any]] = {} # agent_name --> metadata info
 
     # 二级页表, agent -> slots
     agent_remain_budget: Dict[AGENT_ID, List[int]] = defaultdict(list)
@@ -1923,8 +1925,9 @@ class AgentReqToTokenPool(ReqToTokenPool):
     # record each agent instance score, which will be caculated to update importance score
     agent_score: Dict[AGENT_ID, PriorityScore] = defaultdict(PriorityScore)
 
-    batch_size: int = 0
-    FLUSH_THRESHOLD = 2
+    batch_size: int = 0  # iteration batch size
+    FLUSH_THRESHOLD = 2  # need resize budget
+    INIT_BUDGET_PERCENT = 0.05
 
     def __init__(
         self,
@@ -1938,10 +1941,12 @@ class AgentReqToTokenPool(ReqToTokenPool):
     ):
         super().__init__(size, max_context_len, device, enable_memory_saver)
         self.slots_to_agent: Dict[int, str] = {}
+        # default pool
+        self.init_default()
+        # multi-sheduler handshake logic
         self.agent_event_queue = agent_event_queue
         self.agent_ack_queue = agent_ack_queue
         self.agent_receiver_id = agent_receiver_id
-        self.init_default()
 
         self.thread = threading.Thread(target=self._registration, daemon=True)
         self.thread.start()
@@ -1950,63 +1955,93 @@ class AgentReqToTokenPool(ReqToTokenPool):
     def _total_budget(self) -> int:
         return len(self.free_slots)
 
+    @property
+    def _init_budget(self) -> int:
+        desired = max(1, math.ceil(
+            self._total_budget * self.INIT_BUDGET_PERCENT))
+        agent_cnt = max(len(self._agents), 1)
+        feasible_upper = max(1, self._total_budget // agent_cnt)
+        return min(desired, feasible_upper)
+
     def init_default(self):
         if len(self._agents) > 0:
             return
         self.register_agent("default")
 
-    def _rebalance_budget_locked(self):
-        agent_ids = list(self._agents.keys())
-        agent_cnt = len(agent_ids)
-        assert agent_cnt > 0, "At least one agent must be present"
+    def calc_sharpley_contribution(self) -> Dict[str, float]:
+        ...
 
+    def calc_average_contribution(self, agent_ids: List[str]) -> Dict[str, int]:
+        agent_cnt = len(agent_ids)
         raw_scores = {
             agent_id: self.agent_score[agent_id].score
             for agent_id in agent_ids
         }
-        total_score = sum(raw_scores.values())
+        new_agent_ids = [aid for aid in agent_ids if raw_scores[aid] == 0]
+        new_agent_set = set(new_agent_ids)
 
-        if total_score > 0:
-            weights = {
-                agent_id: raw_scores[agent_id] / total_score
-                for agent_id in agent_ids
-            }
-        else:
-            weights = {
-                agent_id: 1.0 / agent_cnt
-                for agent_id in agent_ids
-            }
+        base_slots = self._init_budget
+        guaranteed_total = base_slots * len(new_agent_ids)
+        remaining_slots = self._total_budget - guaranteed_total
+
+        slot_budget = {aid: 0.0 for aid in agent_ids}
+        for aid in new_agent_ids:
+            slot_budget[aid] = float(base_slots)
+
+        positive_total_score = sum(raw_scores.values())
+        if remaining_slots > 0:
+            if positive_total_score > 0:
+                for aid in agent_ids:
+                    if aid in new_agent_set:
+                        continue
+                    slot_budget[aid] += (
+                        remaining_slots * raw_scores[aid] / positive_total_score
+                    )
+            else:
+                even_slots = remaining_slots / agent_cnt
+                for aid in agent_ids:
+                    slot_budget[aid] += even_slots
+
+        total_slots = sum(slot_budget.values())
+        assert total_slots>=0, "Total allocated slots must be greater than 0"
 
         target_total = {
-            agent_id: int(self._total_budget * weights[agent_id]) for agent_id in agent_ids
+            agent_id: int(slot_budget[agent_id])
+            for agent_id in agent_ids
         }
-        exact_alloc = {
-            agent_id: self._total_budget * weights[agent_id] for agent_id in agent_ids
-        }
-
         remainder = self._total_budget - sum(target_total.values())
         if remainder > 0:
             ordered = sorted(
                 agent_ids,
                 key=lambda aid: (
-                    exact_alloc[aid] - target_total[aid], str(aid)),
+                    slot_budget[aid] - target_total[aid], str(aid)),
                 reverse=True,
             )
             for i in range(remainder):
                 target_total[ordered[i % agent_cnt]] += 1
 
+        return target_total
+
+    def _rebalance_budget_locked(self):
+        agent_ids = list(self._agents.keys())
+        agent_cnt = len(agent_ids)
+        assert agent_cnt > 0, "At least one agent must be present"
+        # generate allocation plan
+        alloc_plan = self.calc_average_contribution(agent_ids)
+
         occupied_by_agent: Dict[str, List[int]] = {}
-        occupied_slots: set[int] = set()
         for agent_id in agent_ids:
             slots = self.agent_alloca_budget.get(agent_id, [])
             occupied_by_agent[agent_id] = slots
-            occupied_slots.update(slots)
+
+        # Use real occupied slots to avoid reassigning slots that are still in-flight.
+        occupied_slots: set[int] = set(self.slots_to_agent.keys())
 
         free_slots = [s for s in range(
             self._total_budget) if s not in occupied_slots]
 
         remain_quota = {
-            agent_id: max(target_total[agent_id] -
+            agent_id: max(alloc_plan[agent_id] -
                           len(occupied_by_agent[agent_id]), 0)
             for agent_id in agent_ids
         }
@@ -2017,7 +2052,7 @@ class AgentReqToTokenPool(ReqToTokenPool):
             ordered = sorted(
                 agent_ids,
                 key=lambda aid: (
-                    target_total[aid]
+                    alloc_plan[aid]
                     - (len(occupied_by_agent[aid]) + remain_quota[aid]),
                     str(aid),
                 ),
@@ -2101,6 +2136,10 @@ class AgentReqToTokenPool(ReqToTokenPool):
         agent_id: str,
         metadata: Optional[Dict[str, Any]] = None,
     ):
+        if agent_id in self._agents:
+            logger.info(f"Agent {agent_id} already registered")
+            return
+
         normalized_agent_id, normalized_metadata = self._normalize_agent_metadata(
             agent_id=agent_id,
             metadata=metadata,
@@ -2113,6 +2152,10 @@ class AgentReqToTokenPool(ReqToTokenPool):
             f"Registered agent {normalized_agent_id} with metadata {normalized_metadata}")
 
     def unregister_agent(self, agent_id: str):
+        if agent_id not in self._agents:
+            logger.info(f"Agent {agent_id} not found during unregistration")
+            return
+
         normalized_agent_id, _ = self._normalize_agent_metadata(
             agent_id=agent_id)
 
@@ -2122,14 +2165,9 @@ class AgentReqToTokenPool(ReqToTokenPool):
             self._rebalance_budget_locked()
         logger.info(f"Unregistered agent {normalized_agent_id}")
 
-    def get(self, agent_uuid: str):
-        with self._lock:
-            return self._agents.get(agent_uuid)
-
     def collect_agent_usage(self, req: Req, agent_uuid: Optional[str] = None):
         # TODO: add logits cache tokens
-        if agent_uuid is None:
-            return
+        agent_uuid = agent_uuid if agent_uuid is not None else "default"
 
         with self._lock:
             if agent_uuid not in self._agents:
@@ -2142,7 +2180,8 @@ class AgentReqToTokenPool(ReqToTokenPool):
                 input_toks=len(req.fill_ids)-req.cached_tokens,
                 output_toks=len(req.output_ids),
                 agent_called_times=1,
-                logits_cached_toks=0,
+                logits_allocated_toks=req.logits_cache_budget,
+                logits_hit_toks=req.logits_cache_hit,
             )
             self.batch_size += 1
             if self.batch_size >= self.FLUSH_THRESHOLD:
@@ -2174,9 +2213,11 @@ class AgentReqToTokenPool(ReqToTokenPool):
 
                 if len(self.agent_remain_budget[agent_id]) < 1:
                     select_index.append(-1)
+                    continue
 
-                select_index.extend(self.agent_remain_budget[agent_id][:1])
+                slot = self.agent_remain_budget[agent_id][0]
                 self.agent_remain_budget[agent_id] = self.agent_remain_budget[agent_id][1:]
+                select_index.append(slot)
 
                 self.agent_alloca_budget[agent_id].append(select_index[-1])
                 self.slots_to_agent[select_index[-1]] = agent_id
@@ -2190,13 +2231,19 @@ class AgentReqToTokenPool(ReqToTokenPool):
                 free_index, int) else free_index
             grouped: Dict[str, List[int]] = defaultdict(list)
             for slot in free_list:
-                agent_id = self.slots_to_agent.get(slot)
+                agent_id = self.slots_to_agent.pop(slot, None)
+                if agent_id is None:
+                    continue
                 grouped[agent_id].append(slot)
 
             for agent_id, slots in grouped.items():
+                if agent_id in self.agent_alloca_budget:
+                    release_set = set(slots)
+                    self.agent_alloca_budget[agent_id] = [
+                        s for s in self.agent_alloca_budget[agent_id]
+                        if s not in release_set
+                    ]
                 self.agent_remain_budget[agent_id].extend(slots)
-                for slot in slots:
-                    self.slots_to_agent.pop(slot)
 
     def clear(self):
         with self._lock:
