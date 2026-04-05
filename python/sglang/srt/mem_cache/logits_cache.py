@@ -198,10 +198,10 @@ class LogitsRecord:
             _sample = partial(self.sample_child,
                               sampling_batch_info, req.seqlen)
             # this may consume much time
-            # output_tok, last_token_logits = lo_cache._resampling_normal(
-            #     node, _sample, req)
-            output_tok, last_token_logits = lo_cache._resampling_spot_nodes(
+            output_tok, last_token_logits = lo_cache._resampling_normal(
                 node, _sample, req)
+            # output_tok, last_token_logits = lo_cache._resampling_spot_nodes(
+            #     node, _sample, req)
             self.consumer_queue[req.rid].put((output_tok, last_token_logits))
             e.set()
 
@@ -219,7 +219,12 @@ class LogitsRecord:
 
         # Here we should first check if kv cache is still stored at radix tree
         if self.tree_cache is not None:
-            token_ids = req_info.input_tok.tolist() + output_tok
+            req.fill_ids = req_info.input_tok.tolist() + output_tok
+            input_len = len(req.fill_ids)
+            max_prefix_len = input_len - 1
+            max_prefix_len = max(max_prefix_len, 0)
+            token_ids = req.fill_ids[:max_prefix_len]
+            
             match_result = self.tree_cache.match_prefix(
                 key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
                 **(
@@ -243,7 +248,6 @@ class LogitsRecord:
             )
 
         # update request info
-        req.fill_ids = req_info.input_tok.tolist() + output_tok
         req.output_ids = output_tok
         req.origin_input_ids = req_info.input_tok.tolist()
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
@@ -361,6 +365,14 @@ class LogitsKey:
         return iter(self.logits)
 
     def __getitem__(self, idx: Union[int, slice]) -> LogitsKey:
+        if isinstance(idx, int):
+            seq_len = len(self)
+            normalized_idx = idx if idx >= 0 else seq_len + idx
+            if normalized_idx < 0 or normalized_idx >= seq_len:
+                raise IndexError("LogitsKey index out of range")
+            sliced = slice(normalized_idx, normalized_idx + 1)
+            return LogitsKey(self.logits[sliced], self.logits_result[sliced])
+
         return LogitsKey(self.logits[idx], self.logits_result[idx])
 
 
@@ -714,7 +726,7 @@ class LogitsCache(BasePrefixCache):
                     break
                 child_key = nxt_id
 
-            return output_tok, last_token_logits
+        return output_tok, last_token_logits
 
     def _split_node(self, key: LogitsKey, child: TreeNode, split_len: int):
         # new_node -> child
