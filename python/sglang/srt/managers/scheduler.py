@@ -1793,7 +1793,6 @@ class Scheduler(
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
-        cached_ongoing_decode_batch = []
         cached_eos_decode_batch = []
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -1829,14 +1828,14 @@ class Scheduler(
             
             
             if req.logits_cached:
-                match_result, eos_hint = self.logits_recorder.get_logits_cache(req)
-                if match_result:
-                    if eos_hint:
+                if not req.logits_fetched:
+                    match_result, eos_hint = self.logits_recorder.get_logits_cache(req)
+                    if match_result and eos_hint:
                         cached_eos_decode_batch.append(req)
-                    else:
-                        cached_ongoing_decode_batch.append(req)
-                    continue
-            req.init_next_round_input(self.tree_cache)
+                        continue
+            else:
+                req.init_next_round_input(self.tree_cache)
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -1856,37 +1855,24 @@ class Scheduler(
 
         #TODO need check if reqs is finished
         if len(cached_eos_decode_batch) > 0:
-            ...
-            GenerationBatchResult(
-                logits_output=logits_output,
+            eos_batch = ScheduleBatch.init_new(
+                cached_eos_decode_batch,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+                chunked_req=self.chunked_req,
+                dllm_config=self.dllm_config,
+                enable_logits_cache=False
+            )
+
+            batch_result = GenerationBatchResult(
+                logits_output=req.last_token_logits,
                 can_run_cuda_graph=False,
             )
-        # update decode batch
-        if len(cached_ongoing_decode_batch) > 0:
-            decode_batch = ScheduleBatch.init_new(
-               cached_ongoing_decode_batch,
-               self.req_to_token_pool,
-               self.token_to_kv_pool_allocator,
-               self.tree_cache,
-               self.model_config,
-               self.enable_overlap,
-               self.spec_algorithm,
-               chunked_req=self.chunked_req,
-               enable_logits_cache=True,
-            )
-            decode_batch.prepare_for_cached_decode()
-            self.waiting_queue = [x for x in self.waiting_queue if x not in cached_ongoing_decode_batch]
-            if self.last_batch is None:
-                # preserve safety
-                self.last_batch = decode_batch
-            # add running batch
-            if self.running_batch.is_empty():
-                self.running_batch = self.last_batch
-            else:
-                # Merge running_batch with decode batch
-                self.running_batch.merge_batch(self.last_batch)
-            return decode_batch
-
+            self.result_queue.append((eos_batch.copy(), batch_result))
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list

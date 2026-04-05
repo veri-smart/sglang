@@ -55,10 +55,12 @@ class Req_type(IntEnum):
 	REQUEST: 用于一个节点第一次采样
     RESAMPLE: 用于一个节点的再次采样
     PREFETCH: 用于speculative地选择了下一个节点，但仍然需要等待之前节点的结果的情况，未来实际选择该节点时可以增加一段context
+    SAMPLING_DONE: 指示当前 request 已经采样过了
 	"""
     REQUEST = 0,
     RESAMPLE = 1,
     PREFETCH = 2,
+    SAMPLING_DONE = 3,
 
 class ModelCard(BaseModel):
     """Model cards."""

@@ -582,8 +582,6 @@ class Req:
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
-        # record the whole req cache info (Logits Cache)
-        self.req_kv_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -720,6 +718,7 @@ class Req:
         self.p_rid = p_rid
         self.logits_cache_budget: int = 0
         self.logits_cache_hit: int = 0
+        self.last_token_logits: Optional[torch.Tensor] = None
         # For Agentic
         self.agent_id = agent_id
         # For diffusion LLM
@@ -749,7 +748,11 @@ class Req:
 
     @property
     def logits_cached(self) -> bool:
-        return self.r_type in (Req_type.RESAMPLE, Req_type.PREFETCH)
+        return self.r_type in (Req_type.RESAMPLE, Req_type.PREFETCH, Req_type.SAMPLING_DONE)
+
+    @property
+    def logits_fetched(self) -> bool:
+        return self.r_type == Req_type.SAMPLING_DONE
 
     @property
     def should_cache(self) -> bool:
@@ -1829,14 +1832,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
 
-    def prepare_for_cached_decode(self):
+    def prepare_for_cached_extend(self):
         """
         this function is used to prepare logits cached requests 
         """
-        self.forward_mode = ForwardMode.DECODE
+        self.forward_mode = ForwardMode.EXTEND
 
         reqs = self.reqs
-        input_ids = [r.fill_ids[-1:] for r in reqs]
+        input_ids = [r.fill_ids[len(r.prefix_indices):] for r in reqs]
         output_ids = [r.output_ids for r in reqs]
         extend_num_tokens = len(reqs)
         seq_lens = [len(r.fill_ids) for r in reqs]
