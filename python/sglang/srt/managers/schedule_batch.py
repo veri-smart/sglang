@@ -486,9 +486,10 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
-        r_type: Req_type = None,
-        p_rid: str = None,
-        agent_id: str = None,
+        r_type: Optional[Req_type] = None,
+        p_rid: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        parent_agent_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -721,6 +722,7 @@ class Req:
         self.last_token_logits: Optional[torch.Tensor] = None
         # For Agentic
         self.agent_id = agent_id
+        self.parent_agent_id = parent_agent_id
         # For diffusion LLM
         self.dllm_ids = []
         self.dllm_block_offset = 0

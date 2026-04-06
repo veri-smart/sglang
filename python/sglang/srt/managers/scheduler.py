@@ -34,6 +34,7 @@ import zmq
 from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
+from sglang.srt.mem_cache.memory_pool import AgentReqToTokenPool
 from sglang.srt.mem_cache.logits_cache import LogitsRecord
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
@@ -1696,6 +1697,7 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
+        
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -1931,6 +1933,10 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        # caculate concurrency info
+        if isinstance(self.req_to_token_pool, AgentReqToTokenPool):
+            self.req_to_token_pool.collect_agent_batch_concurrency(new_batch.reqs)
+            self.req_to_token_pool.record_call_graph(new_batch.reqs)
 
         # Mixed-style chunked prefill
         if (

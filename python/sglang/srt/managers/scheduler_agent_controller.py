@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import math
 import threading
 import multiprocessing as mp
 import queue
@@ -22,7 +23,11 @@ class PriorityScore:
     agent_called_times: int
     logits_allocated_toks: int
     logits_hit_toks: int
-    evict_times: int 
+    evict_times: int
+
+    concurrent_reqs_sum: int
+    concurrent_reqs_peak: int
+    batch_presence: int
 
     def __init__(
         self,
@@ -33,6 +38,9 @@ class PriorityScore:
         logits_allocated_toks: int = 0,
         logits_hit_toks: int = 0,
         evict_times: int = 0,
+        concurrent_reqs_sum: int = 0,
+        concurrent_reqs_peak: int = 0,
+        batch_presence: int = 0,
     ):
         self.cached_toks = cached_toks
         self.input_toks = input_toks
@@ -41,6 +49,9 @@ class PriorityScore:
         self.logits_allocated_toks = logits_allocated_toks
         self.logits_hit_toks = logits_hit_toks
         self.evict_times = evict_times
+        self.concurrent_reqs_sum = concurrent_reqs_sum
+        self.concurrent_reqs_peak = concurrent_reqs_peak
+        self.batch_presence = batch_presence
 
     def __add__(self, other: PriorityScore) -> PriorityScore:
         return PriorityScore(
@@ -51,6 +62,10 @@ class PriorityScore:
             logits_allocated_toks=self.logits_allocated_toks + other.logits_allocated_toks,
             logits_hit_toks=self.logits_hit_toks + other.logits_hit_toks,
             evict_times=self.evict_times + other.evict_times,
+            concurrent_reqs_sum=self.concurrent_reqs_sum + other.concurrent_reqs_sum,
+            concurrent_reqs_peak=max(
+                self.concurrent_reqs_peak, other.concurrent_reqs_peak),
+            batch_presence=self.batch_presence + other.batch_presence,
         )
 
     @property
@@ -59,6 +74,11 @@ class PriorityScore:
             return 0.0
         return self.logits_allocated_toks / self.logits_hit_toks
 
+    @property
+    def avg_concurrency(self) -> float:
+        if self.batch_presence == 0:
+            return 0.0
+        return self.concurrent_reqs_sum / self.batch_presence
 
     @property
     def score(self) -> float:
@@ -79,6 +99,55 @@ class PriorityScore:
             + self.evict_times * evict_times_weight
         )
         return _score
+
+    @property
+    def nonlinear_score(self) -> float:
+        """
+        U_i = activity * workload * efficiency * concurrency * eviction penalty
+        ===>
+        U_i = \log(1+\text{calls}_i)
+        \cdot
+        \sqrt{1+\text{input}_i+\text{output}_i}
+        \cdot
+        (1+\text{cache\_eff}_i+1.2\cdot \text{logits\_eff}_i)
+        \cdot
+        (1+0.5\log(1+\text{avg\_conc}_i)+0.3\log(1+\text{peak\_conc}_i))
+        \cdot
+        \frac{1}{1+0.5\cdot \text{evict\_pressure}_i}
+        """
+        input_toks = self.input_toks
+        output_toks = self.output_toks
+        cached_toks = self.cached_toks
+        called_times = self.agent_called_times
+        logits_allocated_toks = self.logits_allocated_toks
+        logits_hit_toks = self.logits_hit_toks
+        evict_times = self.evict_times
+        concurrent_reqs_peak = self.concurrent_reqs_peak
+
+        volume = input_toks + output_toks
+        workload_term = math.sqrt(1.0 + volume)
+        activity_term = math.log1p(called_times)
+
+        cache_eff = cached_toks / (1.0 + input_toks + cached_toks)
+        logits_eff = logits_hit_toks / (1.0 + logits_allocated_toks)
+
+        concurrency_term = (
+            1.0
+            + 0.5 * math.log1p(self.avg_concurrency)
+            + 0.3 * math.log1p(concurrent_reqs_peak)
+        )
+
+        evict_pressure = evict_times / (1.0 + called_times)
+        eviction_term = 1.0 / (1.0 + 0.5 * evict_pressure)
+
+        raw_score = (
+            activity_term
+            * workload_term
+            * (1.0 + 1.0 * cache_eff + 1.2 * logits_eff)
+            * concurrency_term
+            * eviction_term
+        )
+        return raw_score
 
 
 class SglAgentRegisterServer:

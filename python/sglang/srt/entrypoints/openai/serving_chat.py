@@ -220,6 +220,7 @@ class OpenAIServingChat(OpenAIServingBase):
             r_type=request.r_type,
             p_rid=request.p_rid,
             agent_id=request.agent_id,
+            parent_agent_id=request.parent_agent_id,
         )
 
         return adapted_request, request

@@ -374,7 +374,7 @@ class SchedulerOutputProcessorMixin:
                       self.logits_recorder.update_req(req, history_logits)
                     release_kv_cache(req, self.tree_cache, is_complete=req.should_cache)
                 if isinstance(self.req_to_token_pool, AgentReqToTokenPool):
-                    self.req_to_token_pool.collect_agent_usage(req, req.agent_id)
+                    self.req_to_token_pool.collect_agent_token_usage(req, req.agent_id)
                 req.time_stats.completion_time = time.perf_counter()
 
             if req.return_logprob and batch.spec_algorithm.is_none():
@@ -422,6 +422,8 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
+        if isinstance(self.req_to_token_pool, AgentReqToTokenPool):
+            self.req_to_token_pool.check_rebalance()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
         if (

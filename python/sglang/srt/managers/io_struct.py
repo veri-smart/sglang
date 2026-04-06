@@ -178,6 +178,7 @@ class GenerateReqInput(BaseReq):
     return_hidden_states: Union[List[bool], bool] = False
     # For agent id
     agent_id: Optional[Union[List[str], str]] = None
+    parent_agent_id: Optional[Union[List[str], str]] = None
     # For request type
     r_type: Optional[Union[Req_type, List[Req_type]]] = None
     # For prefetched rid
@@ -721,6 +722,7 @@ class TokenizedGenerateReqInput(BaseReq):
     
     # mark an unique agent
     agent_id: str = None
+    parent_agent_id: str = None
 
 
 @dataclass
