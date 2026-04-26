@@ -198,11 +198,23 @@ class SglAgentRegisterServer:
     def init_server(self):
         self.app.router.add_put("/register", self.register_agent)
         self.app.router.add_put("/unregister", self.unregister_agent)
+        self.app.router.add_post("/rebalance", self.rebalance_agents)
+        self.app.router.add_put("/rebalance", self.rebalance_agents)
         self.app.router.add_get("/heartbeat", self.heartbeat)
         self.app.router.add_get("/agent_info", self.get_agent_info)
 
+    async def _maybe_read_json(self, request: web.Request) -> Dict[str, Any]:
+        if request.can_read_body:
+            try:
+                data = await request.json()
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                return {}
+        return {}
+
     async def register_agent(self, request: web.Request):
-        data = await request.json()
+        data = await self._maybe_read_json(request)
         agent_id = data.get("agent_id")
         metadata = data.get("metadata")
         event_id, ok, missing = self._broadcast_event(
@@ -218,7 +230,7 @@ class SglAgentRegisterServer:
         )
 
     async def unregister_agent(self, request: web.Request):
-        data = await request.json()
+        data = await self._maybe_read_json(request)
         agent_id = data.get("agent_id")
         event_id, ok, missing = self._broadcast_event(
             {"op": "unregister", "agent_id": agent_id}
@@ -228,6 +240,22 @@ class SglAgentRegisterServer:
                 "status": "ok" if ok else "error",
                 "event_id": event_id,
                 "missing_receivers": missing,
+            },
+            status=200 if ok else 504,
+        )
+
+    async def rebalance_agents(self, request: web.Request):
+        data = await self._maybe_read_json(request)
+        clear_scores = bool(data.get("clear_scores", False))
+        event_id, ok, missing = self._broadcast_event(
+            {"op": "rebalance", "clear_scores": clear_scores}
+        )
+        return web.json_response(
+            {
+                "status": "ok" if ok else "error",
+                "event_id": event_id,
+                "missing_receivers": missing,
+                "clear_scores": clear_scores,
             },
             status=200 if ok else 504,
         )

@@ -1925,13 +1925,14 @@ class AgentReqToTokenPool(ReqToTokenPool):
     agent_alloca_budget: Dict[AGENT_ID, List[int]] = defaultdict(list)
     # record each agent instance score, which will be caculated to update importance score
     agent_score: Dict[AGENT_ID, PriorityScore] = defaultdict(PriorityScore)
+    agent_priority_score_cache: Dict[AGENT_ID, float] = {}
     # For sharpley value
     shared_cache_tokens: Dict[AGENT_ID, Dict[AGENT_ID, List[int]]] = defaultdict(
         lambda: defaultdict(list)
     )
 
     batch_size: int = 0  # iteration batch size
-    FLUSH_THRESHOLD = 2000  # need resize budget
+    FLUSH_THRESHOLD = 440  # need resize budget
     INIT_BUDGET_PERCENT = 0.05
 
     def __init__(
@@ -2062,7 +2063,8 @@ class AgentReqToTokenPool(ReqToTokenPool):
                     if aid in new_agent_set:
                         continue
                     slot_budget[aid] += (
-                        remaining_slots * fused_scores[aid] / positive_total_score
+                        remaining_slots *
+                        fused_scores[aid] / positive_total_score
                     )
             else:
                 even_slots = remaining_slots / agent_cnt
@@ -2142,10 +2144,14 @@ class AgentReqToTokenPool(ReqToTokenPool):
     def _rebalance_budget_locked(self):
         agent_ids = list(self._agents.keys())
         agent_cnt = len(agent_ids)
-        assert agent_cnt > 0, "At least one agent must be present"
+        if agent_cnt == 0:
+            return
         # generate allocation plan
         # alloc_plan = self.calc_average_contribution(agent_ids)
         alloc_plan = self.calc_sharpley_contribution(agent_ids)
+        self.agent_priority_score_cache = {
+            agent_id: float(alloc_plan.get(agent_id, 0)) for agent_id in agent_ids
+        }
 
         occupied_by_agent: Dict[str, List[int]] = {}
         for agent_id in agent_ids:
@@ -2196,13 +2202,13 @@ class AgentReqToTokenPool(ReqToTokenPool):
             }
             for agent_id in agent_ids
         }
-        logger.info(
-            "Agent budget rebalanced: total_budget=%s, occupied_slots=%s, free_slots=%s, allocation=%s",
-            self._total_budget,
-            len(occupied_slots),
-            len(free_slots),
-            allocation_summary,
-        )
+        # logger.info(
+        #     "Agent budget rebalanced: total_budget=%s, occupied_slots=%s, free_slots=%s, allocation=%s",
+        #     self._total_budget,
+        #     len(occupied_slots),
+        #     len(free_slots),
+        #     allocation_summary,
+        # )
 
     def _normalize_agent_metadata(
         self,
@@ -2229,6 +2235,10 @@ class AgentReqToTokenPool(ReqToTokenPool):
                     self.unregister_agent(agent_id)
                 elif op == "agent_info":
                     self.log_agent_budget_info()
+                elif op == "rebalance":
+                    self.force_rebalance(
+                        clear_scores=bool(event.get("clear_scores", False))
+                    )
                 else:
                     raise RuntimeError(f"Unknown operation: {op}")
 
@@ -2267,6 +2277,20 @@ class AgentReqToTokenPool(ReqToTokenPool):
             }
         logger.info("Agent budget info: %s", info)
 
+    def force_rebalance(self, clear_scores: bool = False):
+        with self._lock:
+            self._rebalance_budget_locked()
+            if clear_scores:
+                self.agent_score.clear()
+                self.batch_size = 0
+            snapshot = self.get_debug_snapshot_unlocked()
+        logger.info(
+            "Force rebalanced agent budget: receiver_id=%s clear_scores=%s",
+            self.agent_receiver_id,
+            clear_scores,
+        )
+        return snapshot
+
     def register_agent(
         self,
         agent_id: str,
@@ -2298,6 +2322,12 @@ class AgentReqToTokenPool(ReqToTokenPool):
         with self._lock:
             self._agents.pop(normalized_agent_id, None)
             self.agent_score.pop(normalized_agent_id, None)
+            self.agent_priority_score_cache.pop(normalized_agent_id, None)
+            self.shared_cache_tokens.pop(normalized_agent_id, None)
+            for parent_id in list(self.shared_cache_tokens.keys()):
+                self.shared_cache_tokens[parent_id].pop(normalized_agent_id, None)
+                if not self.shared_cache_tokens[parent_id]:
+                    self.shared_cache_tokens.pop(parent_id, None)
             self._rebalance_budget_locked()
         logger.info(f"Unregistered agent {normalized_agent_id}")
 
@@ -2340,19 +2370,21 @@ class AgentReqToTokenPool(ReqToTokenPool):
         for req in reqs:
             parent_id, child_id = req.parent_agent_id, req.agent_id
             if parent_id is None or child_id is None:
-                return
+                continue
             assert parent_id in self._agents and child_id in self._agents
             assert child_id != parent_id
             with self._lock:
-                self.shared_cache_tokens[parent_id][child_id] += len(
-                    req.prefix_indices)
+                self.shared_cache_tokens[parent_id][child_id].append(
+                    len(req.prefix_indices))
+                req.parent_agent_id = None
 
     def check_rebalance(self):
         self.batch_size += 1
-        if self.batch_size >= self.FLUSH_THRESHOLD:
-            self._rebalance_budget_locked()
-            self.agent_score.clear()
-            self.batch_size = 0
+        self._rebalance_budget_locked()
+        # if self.batch_size >= self.FLUSH_THRESHOLD:
+        #     self._rebalance_budget_locked()
+            # self.agent_score.clear()
+            # self.batch_size = 0
 
     def remain_budget(self, req: Req) -> int:
         agent_id: str = req.agent_id if req.agent_id is not None else "default"
@@ -2364,6 +2396,72 @@ class AgentReqToTokenPool(ReqToTokenPool):
     def agent_available_size(self, agent_id: str) -> int:
         with self._lock:
             return len(self.agent_remain_budget[agent_id])
+
+    def get_agent_priority_score(self, agent_id: Optional[str] = None) -> float:
+        normalized_agent_id = (
+            str(agent_id) if agent_id is not None else "default"
+        )
+        with self._lock:
+            if normalized_agent_id not in self._agents:
+                return 0.0
+            return self.agent_priority_score_cache.get(normalized_agent_id, 0.0)
+
+    def get_debug_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return self.get_debug_snapshot_unlocked()
+
+    def get_debug_snapshot_unlocked(self) -> Dict[str, Any]:
+        agent_ids = sorted(self._agents.keys(), key=str)
+        return {
+            "registered_agents": [str(agent_id) for agent_id in agent_ids],
+            "agent_priority_score_cache": {
+                str(agent_id): float(
+                    self.agent_priority_score_cache.get(agent_id, 0.0)
+                )
+                for agent_id in agent_ids
+            },
+            "agent_scores": {
+                str(agent_id): self._serialize_priority_score(
+                    self.agent_score[agent_id]
+                )
+                for agent_id in agent_ids
+            },
+            "remain_budget": {
+                str(agent_id): len(self.agent_remain_budget.get(agent_id, []))
+                for agent_id in agent_ids
+            },
+            "allocated_budget": {
+                str(agent_id): len(self.agent_alloca_budget.get(agent_id, []))
+                for agent_id in agent_ids
+            },
+            "shared_cache_edges": {
+                str(parent_id): {
+                    str(child_id): len(tokens)
+                    for child_id, tokens in self.shared_cache_tokens.get(
+                        parent_id, {}
+                    ).items()
+                    if tokens
+                }
+                for parent_id in agent_ids
+                if any(
+                    self.shared_cache_tokens.get(parent_id, {}).get(child_id, [])
+                    for child_id in self.shared_cache_tokens.get(parent_id, {})
+                )
+            },
+            "flush_threshold": int(self.FLUSH_THRESHOLD),
+            "batch_size": int(self.batch_size),
+            "total_budget": int(self._total_budget),
+            "free_slots": int(len(self.free_slots)),
+        }
+
+    @staticmethod
+    def _serialize_priority_score(score: PriorityScore) -> Dict[str, Any]:
+        payload = dataclasses.asdict(score)
+        payload["score"] = float(score.score)
+        payload["nonlinear_score"] = float(score.nonlinear_score)
+        payload["avg_concurrency"] = float(score.avg_concurrency)
+        payload["logits_wasted_ratio"] = float(score.logits_wasted_ratio)
+        return payload
 
     def alloc(self,
               need_size: int,
@@ -2415,7 +2513,9 @@ class AgentReqToTokenPool(ReqToTokenPool):
             self._agents.clear()
             self.agent_remain_budget.clear()
             self.agent_alloca_budget.clear()
-            self._rebalance_budget_locked()
+            self.agent_score.clear()
+            self.agent_priority_score_cache.clear()
+            self.shared_cache_tokens.clear()
 
 
 @triton.jit

@@ -10,9 +10,16 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[Dict[str, int]]:
-        """Return {"cached_tokens": N} only when N > 0 (keeps JSON slim)."""
-        return {"cached_tokens": count} if count > 0 else None
+    def _prompt_token_details(
+        cached_tokens: int = 0, logits_cached_tokens: int = 0
+    ) -> Optional[Dict[str, int]]:
+        """Return prompt token details only when there is something to report."""
+        details: Dict[str, int] = {}
+        if cached_tokens > 0:
+            details["cached_tokens"] = cached_tokens
+        if logits_cached_tokens > 0:
+            details["logits_cached_tokens"] = logits_cached_tokens
+        return details or None
 
     @staticmethod
     def calculate_response_usage(
@@ -27,13 +34,22 @@ class UsageProcessor:
             for i in range(0, len(responses), n_choices)
         )
 
-        cached_details = None
-        if enable_cache_report:
-            cached_total = sum(
+        cached_total = (
+            sum(
                 responses[i]["meta_info"].get("cached_tokens", 0)
                 for i in range(0, len(responses), n_choices)
             )
-            cached_details = UsageProcessor._details_if_cached(cached_total)
+            if enable_cache_report
+            else 0
+        )
+        logits_cached_total = sum(
+            responses[i]["meta_info"].get("logits_cached_tokens", 0)
+            for i in range(0, len(responses), n_choices)
+        )
+        cached_details = UsageProcessor._prompt_token_details(
+            cached_tokens=cached_total,
+            logits_cached_tokens=logits_cached_total,
+        )
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -46,6 +62,7 @@ class UsageProcessor:
         prompt_tokens: Mapping[int, int],
         completion_tokens: Mapping[int, int],
         cached_tokens: Mapping[int, int],
+        logits_cached_tokens: Mapping[int, int],
         n_choices: int,
         enable_cache_report: bool = False,
     ) -> UsageInfo:
@@ -55,12 +72,17 @@ class UsageProcessor:
         )
         total_completion_tokens = sum(completion_tokens.values())
 
-        cached_details = (
-            UsageProcessor._details_if_cached(
+        cached_details = UsageProcessor._prompt_token_details(
+            cached_tokens=(
                 sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
-            )
-            if enable_cache_report
-            else None
+                if enable_cache_report
+                else 0
+            ),
+            logits_cached_tokens=sum(
+                tok
+                for idx, tok in logits_cached_tokens.items()
+                if idx % n_choices == 0
+            ),
         )
 
         return UsageProcessor.calculate_token_usage(

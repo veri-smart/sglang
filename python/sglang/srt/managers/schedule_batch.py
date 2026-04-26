@@ -719,6 +719,7 @@ class Req:
         self.p_rid = p_rid
         self.logits_cache_budget: int = 0
         self.logits_cache_hit: int = 0
+        self.logits_cached_tokens: int = 0
         self.last_token_logits: Optional[torch.Tensor] = None
         # For Agentic
         self.agent_id = agent_id

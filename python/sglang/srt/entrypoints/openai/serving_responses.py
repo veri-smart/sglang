@@ -47,7 +47,6 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
-    PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
@@ -468,6 +467,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
                 num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
+                num_logits_cached_tokens = final_res.meta_info.get(
+                    "logits_cached_tokens", 0
+                )
             elif hasattr(final_res, "prompt_token_ids") and hasattr(
                 final_res, "outputs"
             ):
@@ -481,12 +483,16 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else 0
                 )
                 num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
+                num_logits_cached_tokens = getattr(
+                    final_res, "num_logits_cached_tokens", 0
+                )
                 num_reasoning_tokens = 0
             else:
                 # Final fallback
                 num_prompt_tokens = 0
                 num_generated_tokens = 0
                 num_cached_tokens = 0
+                num_logits_cached_tokens = 0
                 num_reasoning_tokens = 0
 
         usage = UsageInfo(
@@ -495,10 +501,16 @@ class OpenAIServingResponses(OpenAIServingChat):
             total_tokens=num_prompt_tokens + num_generated_tokens,
             reasoning_tokens=num_reasoning_tokens,
         )
-        if self.enable_prompt_tokens_details and num_cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=num_cached_tokens
-            )
+        if self.enable_prompt_tokens_details or num_logits_cached_tokens:
+            prompt_token_details = {}
+            if self.enable_prompt_tokens_details and num_cached_tokens:
+                prompt_token_details["cached_tokens"] = num_cached_tokens
+            if num_logits_cached_tokens:
+                prompt_token_details["logits_cached_tokens"] = (
+                    num_logits_cached_tokens
+                )
+            if prompt_token_details:
+                usage.prompt_tokens_details = prompt_token_details
         request_metadata.final_usage_info = usage
 
         response = ResponsesResponse.from_request(

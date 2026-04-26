@@ -738,7 +738,8 @@ class Scheduler(
                 else self.tp_cpu_group
             ),
             eviction_policy=server_args.radix_eviction_policy,
-            enable_metrics=self.enable_metrics,
+            # enable_metrics=self.enable_metrics,
+            enable_metrics=True,
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
 
@@ -1337,6 +1338,7 @@ class Scheduler(
                 r_type=recv_req.r_type,
                 p_rid=recv_req.p_rid,
                 agent_id=recv_req.agent_id,
+                parent_agent_id=recv_req.parent_agent_id,
             )
             req.tokenizer = self.tokenizer
 
@@ -1795,7 +1797,7 @@ class Scheduler(
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
-        cached_eos_decode_batch = []
+        cached_finished_reqs = []
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
 
@@ -1831,10 +1833,12 @@ class Scheduler(
             
             if req.logits_cached:
                 if not req.logits_fetched:
-                    match_result, eos_hint = self.logits_recorder.get_logits_cache(req)
-                    if match_result and eos_hint:
-                        cached_eos_decode_batch.append(req)
-                        continue
+                    match_result, _ = self.logits_recorder.get_logits_cache(req)
+                    if match_result:
+                        req.check_finished(max(1, req.logits_cached_tokens))
+                        if req.finished():
+                            cached_finished_reqs.append(req)
+                            continue
             else:
                 req.init_next_round_input(self.tree_cache)
 
@@ -1855,29 +1859,21 @@ class Scheduler(
                         self.running_batch.batch_is_full = True
                 break
 
-        #TODO need check if reqs is finished
-        if len(cached_eos_decode_batch) > 0:
-            eos_batch = ScheduleBatch.init_new(
-                cached_eos_decode_batch,
-                self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
-                self.tree_cache,
-                self.model_config,
-                self.enable_overlap,
-                self.spec_algorithm,
-                chunked_req=self.chunked_req,
-                dllm_config=self.dllm_config,
-                enable_logits_cache=False
-            )
-
-            batch_result = GenerationBatchResult(
-                logits_output=req.last_token_logits,
-                can_run_cuda_graph=False,
-            )
-            self.result_queue.append((eos_batch.copy(), batch_result))
-
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        processed_waiting_reqs = set(can_run_list) | set(cached_finished_reqs)
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in processed_waiting_reqs
+        ]
+
+        if cached_finished_reqs:
+            finished_batch = ScheduleBatch(
+                reqs=cached_finished_reqs,
+                return_logprob=any(req.return_logprob for req in cached_finished_reqs),
+            )
+            self.process_batch_result_prebuilt(finished_batch)
+            self.maybe_send_health_check_signal()
+
         if len(can_run_list) == 0:
             return None
 
@@ -1886,9 +1882,6 @@ class Scheduler(
             for req in can_run_list:
                 req.add_latency(RequestStage.PREFILL_WAITING)
 
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -2336,6 +2329,16 @@ class Scheduler(
             )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
+
+        req_pool_debug_snapshot = getattr(
+            self.req_to_token_pool, "get_debug_snapshot", None
+        )
+        if callable(req_pool_debug_snapshot):
+            ret["agent_pool_state"] = req_pool_debug_snapshot()
+
+        tree_cache_debug_snapshot = getattr(self.tree_cache, "get_debug_snapshot", None)
+        if callable(tree_cache_debug_snapshot):
+            ret["tree_cache_state"] = tree_cache_debug_snapshot()
 
         # This field is not serializable.
         ret.pop("model_config", None)

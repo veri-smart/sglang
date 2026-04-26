@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -42,8 +44,32 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _dump_finished_req_logits(
+        self: Scheduler,
+        req: Req,
+        history_logits: torch.Tensor,
+        history_token_ids: List[int],
+    ) -> None:
+        # sampling_temperature = req.sampling_params.temperature
+        dump_path = f"finished_reqs.txt"
+        # record = {
+        #     "rid": req.rid,
+            # "temperature": req.sampling_params.temperature,
+            # "top_p": req.sampling_params.top_p,
+            # "max_new_tokens": req.sampling_params.max_new_tokens,
+            # "input_ids": req.origin_input_ids,
+            # "output_ids": req.output_ids_through_stop,
+            # "history_token_ids": history_token_ids,
+            # "history_logits": history_logits.detach().cpu().tolist(),
+            # "logits_cached_tokens": req.logits_cached_tokens,
+            # "logits_cache_hit": req.logits_cache_hit,
+            # "logits_cache_budget": req.logits_cache_budget,
+        # }
+        # with open(dump_path, "a", encoding="utf-8") as f:
+            # f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # f.write(f"{req.rid}:{req.output_ids_through_stop}\n")
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
-        assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
             req.check_finished()
             if req.finished():
@@ -55,7 +81,8 @@ class SchedulerOutputProcessorMixin:
                     req.rid,
                     thread_finish_flag=True,
                 )
-                release_kv_cache(req, self.tree_cache)
+                if req.req_pool_idx is not None:
+                    release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
@@ -362,16 +389,24 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
-                with open("finished_reqs.txt", "a") as f:
-                    f.write(f"{req.rid}:{req.output_ids}\n")
+                history_logits = None
+                history_token_ids = None
+                if req.should_cache and req.rid in self.logits_recorder.req_logits_key:
+                    history_logits, history_token_ids = self.logits_recorder.summary(
+                        req.rid
+                    )
+                    # self._dump_finished_req_logits(
+                    #     req, history_logits, history_token_ids
+                    # )
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         release_kv_cache(req, self.tree_cache)
                 else:
                     if req.should_cache:
-                      history_logits, _ = self.logits_recorder.summary(req.rid)
-                      self.logits_recorder.update_req(req, history_logits)
+                        if history_logits is None:
+                            history_logits, _ = self.logits_recorder.summary(req.rid)
+                        self.logits_recorder.update_req(req, history_logits)
                     release_kv_cache(req, self.tree_cache, is_complete=req.should_cache)
                 if isinstance(self.req_to_token_pool, AgentReqToTokenPool):
                     self.req_to_token_pool.collect_agent_token_usage(req, req.agent_id)
@@ -760,6 +795,7 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        logits_cached_tokens = []
         spec_verify_ct = []
         spec_accepted_tokens = []
         retraction_counts = []
@@ -868,6 +904,7 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+                logits_cached_tokens.append(req.logits_cached_tokens)
                 retraction_counts.append(req.retraction_count)
 
                 queue_times.append(req.time_stats.get_queueing_time())
@@ -988,6 +1025,7 @@ class SchedulerOutputProcessorMixin:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
+                    logits_cached_tokens=logits_cached_tokens,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,

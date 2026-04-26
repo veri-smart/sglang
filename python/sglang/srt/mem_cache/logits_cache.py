@@ -1,5 +1,6 @@
 from __future__ import annotations
 import heapq
+import os
 from queue import Queue, Empty
 import threading
 import logging
@@ -36,6 +37,9 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+NORMAL_RESAMPLING_MAX_LOGITS = 500
+SPOT_RESAMPLING_IMPORTANCE_THRESHOLD = 0.6
 
 
 @dataclass
@@ -78,9 +82,19 @@ class LogitsRecord:
         default_factory=dict, repr=False)
     event_pool: Dict[str, threading.Event] = field(
         default_factory=dict, repr=False)
+    resampling_mode: str = field(default="normal", repr=False)
 
     def __post_init__(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
+        self.resampling_mode = os.getenv(
+            "SGLANG_LOGITS_CACHE_RESAMPLING_MODE", "normal"
+        ).strip().lower()
+        if self.resampling_mode not in {"normal", "spot_nodes"}:
+            logger.warning(
+                "Unknown logits cache resampling mode %r, fallback to 'normal'",
+                self.resampling_mode,
+            )
+            self.resampling_mode = "normal"
 
         t = threading.Thread(
             target=self.produce_nxt_logits,
@@ -122,29 +136,46 @@ class LogitsRecord:
     def record_batch(self, batch: ScheduleBatch, logits_info: GenerationBatchResult):
         logits = logits_info.logits_output.cloned_next_token_logits
         logits_results = logits_info.next_token_ids
+        if logits is None or logits_results is None:
+            return
+
+        cache_row = 0
         for ind, req in enumerate(batch.reqs):
             if not req.should_cache:
                 continue
+            if cache_row >= len(logits):
+                logger.warning(
+                    "Skip logits cache record for rid=%s due to mismatched logits rows "
+                    "(cache_row=%d, logits_rows=%d, batch_reqs=%d)",
+                    req.rid,
+                    cache_row,
+                    len(logits),
+                    len(batch.reqs),
+                )
+                break
             if req.rid in self.req_logits_key:
                 self.req_logits_key[req.rid].append(
-                    LogitsKey(logits[ind], logits_results[ind]))
+                    LogitsKey(logits[cache_row], logits_results[ind]))
+                cache_row += 1
                 continue
             if batch.forward_mode.is_decode():
                 # forget cached request
                 self.req_logits_key[req.rid] = [
-                    LogitsKey(logits[ind], logits_results[ind])]
+                    LogitsKey(logits[cache_row], logits_results[ind])]
+                cache_row += 1
                 continue
 
             assert batch.forward_mode.is_extend(), "encounter strange mode"
             ins_kv_indices = batch.req_to_token_pool.req_to_token[req.req_pool_idx][: len(
                 req.fill_ids)]
             self.req_logits_key[req.rid] = [
-                LogitsKey(logits[ind], logits_results[ind])]
+                LogitsKey(logits[cache_row], logits_results[ind])]
             self.req_info[req.rid] = Recorder(
                 req.origin_input_ids, ins_kv_indices)
             self.logits_cache[req.rid] = LogitsCache(
                 page_size=1, disable=False)
             self.consumer_queue[req.rid] = Queue()
+            cache_row += 1
 
     def summary(self, rid: str) -> Optional[Tuple[torch.Tensor, List[int]]]:
         assert rid in self.req_logits_key, "rid must stored at req_logits_key"
@@ -162,8 +193,21 @@ class LogitsRecord:
         assert len(req.output_ids) <= history_logits.shape[0]
         logits_token_ids = req.output_ids
         history_logits = history_logits[:len(req.output_ids)]
+        # Normal resampling replays from the tree root, so we keep a bounded prefix.
+        if len(logits_token_ids) > NORMAL_RESAMPLING_MAX_LOGITS:
+            logits_token_ids = logits_token_ids[:NORMAL_RESAMPLING_MAX_LOGITS]
+            history_logits = history_logits[:NORMAL_RESAMPLING_MAX_LOGITS]
         cache_tree = self.logits_cache[req.rid]
-        ind = self.select_topk_logits(history_logits, top_k=5)
+        ind = []
+        if len(logits_token_ids) > 1:
+            importance_threshold = self.get_spot_importance_threshold()
+            ind = [
+                idx + 1
+                for idx in self.select_topk_logits(
+                    history_logits[1:],
+                    threshold=importance_threshold,
+                )
+            ]
         hit_cnt = cache_tree.insert(LogitsKey(
             history_logits, logits_token_ids), spotNodes=ind)
         cache_tree.init_time = time.monotonic()  # update timing
@@ -198,10 +242,14 @@ class LogitsRecord:
             _sample = partial(self.sample_child,
                               sampling_batch_info, req.seqlen)
             # this may consume much time
-            output_tok, last_token_logits = lo_cache._resampling_normal(
-                node, _sample, req)
-            # output_tok, last_token_logits = lo_cache._resampling_spot_nodes(
-            #     node, _sample, req)
+            if self.resampling_mode == "spot_nodes":
+                output_tok, last_token_logits = lo_cache._resampling_spot_nodes(
+                    node, _sample, req
+                )
+            else:
+                output_tok, last_token_logits = lo_cache._resampling_normal(
+                    node, _sample, req
+                )
             self.consumer_queue[req.rid].put((output_tok, last_token_logits))
             e.set()
 
@@ -234,7 +282,8 @@ class LogitsRecord:
                 ),
             )
             
-            self.log_cache_info(req, len(token_ids)-1)
+            req.logits_cached_tokens = len(output_tok)
+            self.log_cache_info(req, req.logits_cached_tokens)
             (
                 req.prefix_indices,
                 req.last_node,
@@ -321,11 +370,21 @@ class LogitsRecord:
             logit_bias=logit_bias,
         )
 
+    def get_spot_importance_threshold(self) -> float:
+        return float(
+            os.getenv(
+                "SGLANG_LOGITS_CACHE_SPOT_IMPORTANCE_THRESHOLD",
+                str(SPOT_RESAMPLING_IMPORTANCE_THRESHOLD),
+            )
+        )
+
     def select_topk_logits(
         self,
         logits: torch.Tensor,
-        top_k: int,
+        threshold: float,
     ) -> List:
+        if logits.shape[0] == 0:
+            return []
         # Compute per-step entropy for the logits sequence.
         log_probs = torch.log_softmax(logits, dim=-1)
         probs = log_probs.exp()
@@ -340,10 +399,20 @@ class LogitsRecord:
         t = torch.arange(len(entropy), device=entropy.device)
         time_weight = 1 / (1 + 0.002 * t)
         importance *= time_weight
+        imp_min = importance.min()
+        imp_max = importance.max()
+        if torch.isclose(imp_max, imp_min):
+            normalized = torch.zeros_like(importance)
+        else:
+            normalized = (importance - imp_min) / (imp_max - imp_min)
+        return torch.nonzero(normalized > threshold, as_tuple=False).flatten().tolist()
 
-        weights = importance / importance.sum()
-        indices = torch.topk(weights, top_k).indices
-        return indices.tolist()
+    def select_spot_logits(
+        self,
+        logits: torch.Tensor,
+        threshold: float,
+    ) -> List:
+        return self.select_topk_logits(logits, threshold)
 
 
 @dataclass
@@ -519,6 +588,36 @@ class LogitsCache(BasePrefixCache):
             )
         self.reset()
 
+    def _register_spot_offsets(self, node: TreeNode, offsets: List[int]):
+        if not offsets:
+            return
+        valid_offsets = sorted(
+            {
+                int(off)
+                for off in offsets
+                if node.key is not None and 0 < int(off) < len(node.key)
+            }
+        )
+        if not valid_offsets:
+            return
+        existing = self._spot_node_to_offset.get(node, [])
+        self._spot_node_to_offset[node] = sorted(set(existing).union(valid_offsets))
+
+    def _remap_spot_offsets_for_split(
+        self,
+        child: TreeNode,
+        new_node: TreeNode,
+        split_len: int,
+    ):
+        offsets = self._spot_node_to_offset.pop(child, [])
+        if not offsets:
+            return
+
+        new_node_offsets = [off for off in offsets if 0 < off < split_len]
+        child_offsets = [off - split_len for off in offsets if off > split_len]
+        self._register_spot_offsets(new_node, new_node_offsets)
+        self._register_spot_offsets(child, child_offsets)
+
     ##### Public API #####
 
     def reset(self):
@@ -675,56 +774,53 @@ class LogitsCache(BasePrefixCache):
         req: Req,
     ) -> Tuple[List[int], Optional[torch.Tensor]]:
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-        output_tok: List[int] = []
-        last_token_logits: Optional[torch.Tensor] = None
+        root_logit = LogitsProcessorOutput(next_token_logits=node.key.logits)
+        child_key = _sample(root_logit).item()
+        output_tok: List[int] = [child_key]
+        last_token_logits: Optional[torch.Tensor] = root_logit.next_token_logits
         eos_set = req.eos_token_ids
-        should_exit = False
 
-        def get_child_key(node: TreeNode) -> int:
-            if node in self._spot_node_to_offset:
-                ...
-            else:
-                assert len(
-                    node.children) == 1, "Non-spot node should have only one child"
-                return next(iter(node.children.keys()))
+        if child_key in eos_set:
+            return output_tok, last_token_logits
 
-        child_key = get_child_key(node)
-        while not should_exit:
+        while True:
             child = node.children.get(child_key)
             if child is None:
                 break
-            if child not in self._spot_node_to_offset:
-                output_tok.extend(child.key.logits_result)
-                if len(child.key.logits_result) > 0:
-                    last_token_logits = child.key.logits[len(child.key.logits_result) - 1: len(child.key.logits_result)]
-            else:
-                logits_res = child.key.logits_result
 
-                offset = self._spot_node_to_offset[child]
-                base_start = 0
-                for off in offset:
-                    output_tok.extend(logits_res[base_start:off])
+            logits_res = child.key.logits_result
+            spot_offsets = sorted(self._spot_node_to_offset.get(child, []))
+            base_start = 1
 
-                    off_logit = LogitsProcessorOutput(
-                        next_token_logits=child.key.logits[off:off + 1]
-                    )
-                    last_token_logits = off_logit.next_token_logits
-                    nxt_id = _sample(off_logit).item()
-                    if logits_res[off] != nxt_id:
-                        output_tok.append(nxt_id)
-                        should_exit = True
-                        break
+            for off in spot_offsets:
+                if off < base_start or off >= len(logits_res):
+                    continue
 
-                    if nxt_id in eos_set:
-                        output_tok.append(nxt_id)
-                        should_exit = True
-                        break
+                output_tok.extend(logits_res[base_start:off])
 
-                    base_start = off
-                node = child
-                if should_exit:
-                    break
-                child_key = nxt_id
+                off_logit = LogitsProcessorOutput(
+                    next_token_logits=child.key.logits[off:off + 1]
+                )
+                last_token_logits = off_logit.next_token_logits
+                nxt_id = _sample(off_logit).item()
+                output_tok.append(nxt_id)
+
+                if logits_res[off] != nxt_id or nxt_id in eos_set:
+                    return output_tok, last_token_logits
+
+                base_start = off + 1
+
+            output_tok.extend(logits_res[base_start:])
+            if len(logits_res) > base_start:
+                last_token_logits = child.key.logits[
+                    len(logits_res) - 1: len(logits_res)
+                ]
+
+            if output_tok[-1] in eos_set:
+                break
+
+            node = child
+            child_key = output_tok[-1]
 
         return output_tok, last_token_logits
 
@@ -742,6 +838,7 @@ class LogitsCache(BasePrefixCache):
         child.key = child.key[split_len:]
         child.value = child.value[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
+        self._remap_spot_offsets_for_split(child, new_node, split_len)
 
         return new_node
 
@@ -754,7 +851,8 @@ class LogitsCache(BasePrefixCache):
     def _insert_helper(self, node: TreeNode, key: LogitsKey, value: torch.Tensor, spotNodes: List):
         access_time = time.monotonic()
         node.last_access_time = access_time
-        spotNodes.sort()
+        spotNodes = sorted(int(ind) for ind in spotNodes if int(ind) > 0)
+        spot_ptr = 0
         if len(key) == 0:
             return 0
 
@@ -766,18 +864,30 @@ class LogitsCache(BasePrefixCache):
 
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
-        start_index = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = access_time
             prefix_len = self.key_match_fn(node.key, key)
-            total_prefix_length += prefix_len
+
+            segment_start = total_prefix_length
+            segment_end = segment_start + prefix_len
+            node_spots = []
+            while spot_ptr < len(spotNodes) and spotNodes[spot_ptr] < segment_end:
+                rel_offset = spotNodes[spot_ptr] - segment_start
+                if rel_offset > 0:
+                    node_spots.append(rel_offset)
+                spot_ptr += 1
+
             key = key[prefix_len:]
             value = value[prefix_len:]
 
             if prefix_len < len(node.key.logits_result):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
+                node_spots = [off for off in node_spots if off < prefix_len]
+
+            self._register_spot_offsets(node, node_spots)
+            total_prefix_length = segment_end
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
@@ -790,9 +900,14 @@ class LogitsCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)
-            for ind in spotNodes:
-                self._spot_index_to_node[ind] = new_node
-                self._spot_node_to_offset[new_node].append(ind - start_index)
+            remaining_offsets = []
+            while spot_ptr < len(spotNodes):
+                rel_offset = spotNodes[spot_ptr] - total_prefix_length
+                if 0 < rel_offset < len(new_node.key):
+                    remaining_offsets.append(rel_offset)
+                    self._spot_index_to_node[spotNodes[spot_ptr]] = new_node
+                spot_ptr += 1
+            self._register_spot_offsets(new_node, remaining_offsets)
         return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):

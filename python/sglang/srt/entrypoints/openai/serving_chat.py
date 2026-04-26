@@ -84,6 +84,7 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+        self._warned_missing_chat_template_fallback = False
 
     def _use_dpsk_v32_encoding(self) -> bool:
         has_chat_template = (
@@ -93,6 +94,86 @@ class OpenAIServingChat(OpenAIServingBase):
         architectures = self.tokenizer_manager.server_args.get_hf_config().architectures
         is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
         return not has_chat_template and is_dpsk_v32
+
+    def _has_tokenizer_chat_template(self) -> bool:
+        return (
+            self.tokenizer_manager.tokenizer is not None
+            and self.tokenizer_manager.tokenizer.chat_template is not None
+        )
+
+    def _build_fallback_text_prompt(
+        self, request: ChatCompletionRequest, is_multimodal: bool
+    ) -> MessageProcessingResult:
+        if is_multimodal:
+            raise ValueError(
+                "Cannot serve multimodal chat messages without a configured chat template."
+            )
+        if request.tools:
+            raise ValueError(
+                "Cannot serve tool-enabled chat messages without a configured chat template."
+            )
+
+        if not self._warned_missing_chat_template_fallback:
+            logger.warning(
+                "Tokenizer chat_template is not set; falling back to a plain-text chat prompt."
+            )
+            self._warned_missing_chat_template_fallback = True
+
+        role_labels = {
+            "system": "System",
+            "user": "User",
+            "assistant": "Assistant",
+            "tool": "Tool",
+            "function": "Tool",
+        }
+
+        prompt_parts: List[str] = []
+        last_message_is_assistant = False
+        for idx, message in enumerate(request.messages):
+            role = message.role or "user"
+            if role not in role_labels:
+                raise ValueError(
+                    f"Cannot serve chat role '{role}' without a configured chat template."
+                )
+
+            content = message.content or ""
+            if not isinstance(content, str):
+                raise ValueError(
+                    "Cannot serve structured chat content without a configured chat template."
+                )
+
+            prompt_parts.append(f"{role_labels[role]}: {content}")
+            last_message_is_assistant = (
+                idx == len(request.messages) - 1 and role == "assistant"
+            )
+
+        prompt = "\n\n".join(prompt_parts)
+        if not (request.continue_final_message and last_message_is_assistant):
+            prompt = f"{prompt}\n\nAssistant:"
+
+        if (
+            self._get_reasoning_from_request(request)
+            and self.reasoning_parser not in ["qwen3", "qwen3-thinking", "glm4"]
+        ):
+            prompt += "<think>"
+
+        stop = [] if request.ignore_eos else []
+        if request.stop:
+            if isinstance(request.stop, str):
+                stop.append(request.stop)
+            else:
+                stop.extend(request.stop)
+
+        prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+        return MessageProcessingResult(
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            image_data=None,
+            video_data=None,
+            audio_data=None,
+            modalities=[],
+            stop=stop,
+        )
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -277,6 +358,9 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal: bool,
     ) -> MessageProcessingResult:
         """Apply Jinja chat template"""
+        if not self._has_tokenizer_chat_template() and not self.use_dpsk_v32_encoding:
+            return self._build_fallback_text_prompt(request, is_multimodal)
+
         prompt = ""
         prompt_ids = []
         openai_compatible_messages = []
@@ -514,6 +598,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        logits_cached_tokens = {}
         hidden_states = {}
 
         try:
@@ -525,6 +610,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                logits_cached_tokens[index] = content["meta_info"].get(
+                    "logits_cached_tokens", 0
+                )
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
 
                 # Handle logprobs
@@ -713,6 +801,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
+                    logits_cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )

@@ -1744,7 +1744,7 @@ class ModelRunner:
         # create token size for hybrid cache
         if self.is_hybrid_swa:
             self.set_num_token_hybrid()
-
+        # self.max_total_num_tokens = 18000
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
                 f"Not enough memory. Please try to increase --mem-fraction-static. "

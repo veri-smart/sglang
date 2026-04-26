@@ -322,7 +322,7 @@ class HiRadixCache(RadixCache):
         start_time = time.perf_counter()
         leaves = self._collect_leaves_device()
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self._get_eviction_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
@@ -351,7 +351,7 @@ class HiRadixCache(RadixCache):
                     break
             else:
                 # all children are evicted or no children
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = self._get_eviction_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
         if self.cache_controller.write_policy == "write_back":
@@ -380,7 +380,7 @@ class HiRadixCache(RadixCache):
     def evict_host(self, num_tokens: int):
         leaves = self._collect_leaves()
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self._get_eviction_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
@@ -405,7 +405,7 @@ class HiRadixCache(RadixCache):
             del x.parent.children[k]
 
             if len(x.parent.children) == 0 and x.parent.evicted:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = self._get_eviction_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def load_back(
@@ -808,6 +808,7 @@ class HiRadixCache(RadixCache):
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # child node split into new_node -> child
         new_node = TreeNode(priority=child.priority)
+        new_node.agent_ids = set(child.agent_ids)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -838,6 +839,7 @@ class HiRadixCache(RadixCache):
         value=None,
         chunked: bool = False,
         priority: int | None = None,
+        agent_id: Optional[str] = None,
     ):
         if priority is None:
             priority = 0
@@ -861,6 +863,7 @@ class HiRadixCache(RadixCache):
             prefix_len = self.key_match_fn(node.key, key)
 
             if prefix_len == len(node.key):
+                self._attach_agent_to_node(node, agent_id)
                 if node.evicted:
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
@@ -874,6 +877,7 @@ class HiRadixCache(RadixCache):
                 new_node = self._split_node(node.key, node, prefix_len)
                 # shared-prefix node should also reflect max priority
                 new_node.priority = max(new_node.priority, priority)
+                self._attach_agent_to_node(new_node, agent_id)
                 if new_node.evicted:
                     new_node.value = value[:prefix_len]
                     self.evictable_size_ += len(new_node.value)
@@ -893,6 +897,7 @@ class HiRadixCache(RadixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
+            self._attach_agent_to_node(new_node, agent_id)
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
 

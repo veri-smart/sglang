@@ -28,7 +28,7 @@ import sys
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.evict_policy import (
+    AgentPriorityStrategy,
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
@@ -108,6 +109,8 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # agents that have contributed to or reused this cached segment
+        self.agent_ids: set[str] = set()
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -289,9 +292,11 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
         elif self.eviction_policy == "priority":
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
+        elif self.eviction_policy == "agent_priority":
+            self.eviction_strategy = AgentPriorityStrategy(self._get_agent_priority)
         else:
             raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority'."
+                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'agent_priority'."
             )
         self.reset()
 
@@ -325,6 +330,12 @@ class RadixCache(BasePrefixCache):
         self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self.eviction_call_count = 0
+        self.eviction_batch_count = 0
+        self.total_evicted_tokens = 0
+        self.total_evicted_nodes = 0
+        self.evicted_tokens_by_agent: Dict[str, int] = defaultdict(int)
+        self.evicted_nodes_by_agent: Dict[str, int] = defaultdict(int)
         self._record_all_cleared_event()
 
     def maybe_bigram_convert(
@@ -409,16 +420,32 @@ class RadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: RadixKey, value=None, chunked=False, priority: int = 0):
+    def insert(
+        self,
+        key: RadixKey,
+        value=None,
+        chunked=False,
+        agent_id: str = None,
+        priority: int = 0,
+    ):
         if self.disable:
             return 0
+        if agent_id is None:
+            agent_id = "default"
 
         if value is None:
             value = torch.tensor(key.token_ids, dtype=torch.int64)
 
         key, value = self.maybe_bigram_convert(key, value)
 
-        return self._insert_helper(self.root_node, key, value, priority)
+        return self._insert_helper(
+            self.root_node,
+            key,
+            value,
+            priority,
+            chunked=chunked,
+            agent_id=agent_id,
+        )
 
     def _page_align_keys(self, key: list) -> list:
         if self.page_size == 1:
@@ -459,8 +486,12 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
-            priority = getattr(req, "priority", 0) or 0
-            new_prefix_len = self.insert(radix_key, values, priority=priority)
+            new_prefix_len = self.insert(
+                radix_key,
+                values,
+                priority=self._get_insert_priority(req),
+                agent_id=req.agent_id,
+            )
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
@@ -498,7 +529,8 @@ class RadixCache(BasePrefixCache):
             radix_key,
             values,
             chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+            priority=self._get_insert_priority(req),
+            agent_id=req.agent_id,
         )
 
         self.token_to_kv_pool_allocator.free(
@@ -553,25 +585,49 @@ class RadixCache(BasePrefixCache):
         start_time = time.perf_counter()
         leaves = self._collect_leaves()
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self._get_eviction_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
+        if eviction_heap:
+            self.eviction_batch_count += 1
 
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
             self.token_to_kv_pool_allocator.free(x.value)
-            num_evicted += len(x.value)
+            evicted_tokens = len(x.value)
+            num_evicted += evicted_tokens
+            self.eviction_call_count += 1
+            self.total_evicted_tokens += evicted_tokens
+            self.total_evicted_nodes += 1
+            if x.agent_ids:
+                for agent_id in x.agent_ids:
+                    self.evicted_tokens_by_agent[str(agent_id)] += evicted_tokens
+                    self.evicted_nodes_by_agent[str(agent_id)] += 1
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = self._get_eviction_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
+
+    def get_debug_snapshot(self) -> Dict[str, Any]:
+        return {
+            "eviction_policy": self.eviction_policy,
+            "evictable_size": int(self.evictable_size_),
+            "protected_size": int(self.protected_size_),
+            "total_size": int(self.total_size()),
+            "eviction_batches": int(self.eviction_batch_count),
+            "eviction_calls": int(self.eviction_call_count),
+            "evicted_tokens": int(self.total_evicted_tokens),
+            "evicted_nodes": int(self.total_evicted_nodes),
+            "evicted_tokens_by_agent": dict(sorted(self.evicted_tokens_by_agent.items())),
+            "evicted_nodes_by_agent": dict(sorted(self.evicted_nodes_by_agent.items())),
+        }
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
@@ -638,10 +694,12 @@ class RadixCache(BasePrefixCache):
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+                self._inc_hit_count(new_node)
                 value.append(new_node.value)
                 node = new_node
                 break
             else:
+                self._inc_hit_count(child)
                 value.append(child.value)
                 node = child
                 key = key[prefix_len:]
@@ -656,6 +714,7 @@ class RadixCache(BasePrefixCache):
         # New node inherits child's priority (represents shared prefix)
         self._record_remove_event(child)
         new_node = TreeNode(priority=child.priority)
+        new_node.agent_ids = set(child.agent_ids)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
@@ -673,7 +732,15 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: RadixKey, value, priority: int = 0):
+    def _insert_helper(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        priority: int = 0,
+        chunked: bool = False,
+        agent_id: Optional[str] = None,
+    ):
         # Convert None priority to 0
         if priority is None:
             priority = 0
@@ -698,9 +765,13 @@ class RadixCache(BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
+                self._attach_agent_to_node(new_node, agent_id)
+                self._inc_hit_count(new_node, chunked=chunked)
                 node = new_node
             else:
                 node.priority = max(node.priority, priority)
+                self._attach_agent_to_node(node, agent_id)
+                self._inc_hit_count(node, chunked=chunked)
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
@@ -710,23 +781,64 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
+            self._attach_agent_to_node(new_node, agent_id)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
         return total_prefix_length
 
+    def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
+        if chunked:
+            return
+        node.hit_count += 1
+
+    def _attach_agent_to_node(self, node: TreeNode, agent_id: Optional[str]):
+        if agent_id is None:
+            return
+        node.agent_ids.add(agent_id)
+
+    def _get_insert_priority(self, req: Req) -> int:
+        if self.eviction_policy != "priority":
+            return 0
+        return getattr(req, "priority", 0) or 0
+
+    def _get_agent_priority(self, agent_id: str) -> float:
+        if self.req_to_token_pool is None:
+            return 0.0
+
+        getter = getattr(self.req_to_token_pool, "get_agent_priority_score", None)
+        if getter is None:
+            return 0.0
+
+        try:
+            return float(getter(agent_id))
+        except Exception:
+            logger.debug(
+                "Failed to fetch agent priority for %s from %s",
+                agent_id,
+                type(self.req_to_token_pool).__name__,
+                exc_info=True,
+            )
+            return 0.0
+
+    def _get_eviction_priority(self, node: TreeNode):
+        return self.eviction_strategy.get_priority(node)
+
+    def _format_node_debug(self, node: TreeNode) -> str:
+        agent_ids = sorted(str(agent_id) for agent_id in node.agent_ids)
+        agent_repr = f" agents={agent_ids}" if agent_ids else " agents=[]"
+        return (
+            f"{len(node.key)} {node.key.token_ids[:10]} "
+            f"r={node.lock_ref}{agent_repr}"
+        )
+
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
         stack = [(node, indent)]
         while stack:
             current_node, current_indent = stack.pop()
-            print(
-                " " * current_indent,
-                len(current_node.key),
-                current_node.key.token_ids[:10],
-                f"r={current_node.lock_ref}",
-            )
+            print(" " * current_indent + self._format_node_debug(current_node))
             for key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))
 

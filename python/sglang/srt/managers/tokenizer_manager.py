@@ -1620,6 +1620,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     {
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
+                        "logits_cached_tokens": recv_obj.logits_cached_tokens[i],
                     }
                 )
 
