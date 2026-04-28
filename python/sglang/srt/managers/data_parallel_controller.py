@@ -35,6 +35,9 @@ from sglang.srt.managers.io_struct import (
     WatchLoadUpdateReq,
 )
 from sglang.srt.managers.schedule_batch import Req, RequestStage
+from sglang.srt.managers.scheduler_agent_controller import (
+    run_agent_register_server_process,
+)
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
@@ -156,6 +159,11 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
+        self.agent_event_queues = []
+        self.agent_ack_queue = (
+            mp.Queue() if server_args.enable_agent_serving else None
+        )
+        self.agent_receiver_ids = []
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -164,7 +172,26 @@ class DataParallelController:
             self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
 
+        if server_args.enable_agent_serving:
+            self.launch_agent_register_server(server_args)
+
         self.init_dispatcher()
+
+    def launch_agent_register_server(self, server_args: ServerArgs):
+        proc = mp.Process(
+            target=run_agent_register_server_process,
+            args=(
+                server_args.agent_server_addr,
+                self.agent_event_queues,
+                self.agent_ack_queue,
+                self.agent_receiver_ids,
+                server_args.node_rank,
+                server_args.nnodes,
+                server_args.dist_init_addr,
+            ),
+        )
+        proc.start()
+        self.scheduler_procs.append(proc)
 
     def send_to_all_workers(self, obj):
         for worker in self.workers:
@@ -428,6 +455,12 @@ class DataParallelController:
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
+                    receiver_id = f"dp{dp_rank}_{pp_rank}_{tp_rank}"
+                    agent_event_queue = None
+                    if server_args.enable_agent_serving:
+                        agent_event_queue = mp.Queue()
+                        self.agent_event_queues.append(agent_event_queue)
+                        self.agent_receiver_ids.append(receiver_id)
                     proc = mp.Process(
                         target=self.run_scheduler_process,
                         args=(
@@ -439,6 +472,9 @@ class DataParallelController:
                             pp_rank,
                             dp_rank,
                             writer,
+                            agent_event_queue,
+                            self.agent_ack_queue,
+                            receiver_id,
                         ),
                     )
                     with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(

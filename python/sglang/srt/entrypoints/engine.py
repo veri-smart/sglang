@@ -806,7 +806,7 @@ def _launch_subprocesses(
 
     scheduler_procs = []
     agent_event_queues = []
-    agent_ack_queue = mp.Queue()
+    agent_ack_queue = mp.Queue() if server_args.enable_agent_serving else None
     agent_receiver_ids = []
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
@@ -841,9 +841,11 @@ def _launch_subprocesses(
 
                 with maybe_reindex_device_id(gpu_id) as gpu_id:
                     receiver_id = f"{pp_rank}_{tp_rank}"
-                    agent_event_queue = mp.Queue()
-                    agent_event_queues.append(agent_event_queue)
-                    agent_receiver_ids.append(receiver_id)
+                    agent_event_queue = None
+                    if server_args.enable_agent_serving:
+                        agent_event_queue = mp.Queue()
+                        agent_event_queues.append(agent_event_queue)
+                        agent_receiver_ids.append(receiver_id)
                     proc = mp.Process(
                         target=run_scheduler_process,
                         args=(
@@ -878,17 +880,21 @@ def _launch_subprocesses(
         proc.start()
         scheduler_procs.append(proc)
 
-    proc = mp.Process(
-        target=run_agent_register_server_process,
-        args=(
-            server_args.agent_server_addr,
-            agent_event_queues,
-            agent_ack_queue,
-            agent_receiver_ids,
-        ),
-    )
-    proc.start()
-    scheduler_procs.append(proc)
+    if server_args.enable_agent_serving and server_args.dp_size == 1:
+        proc = mp.Process(
+            target=run_agent_register_server_process,
+            args=(
+                server_args.agent_server_addr,
+                agent_event_queues,
+                agent_ack_queue,
+                agent_receiver_ids,
+                server_args.node_rank,
+                server_args.nnodes,
+                server_args.dist_init_addr,
+            ),
+        )
+        proc.start()
+        scheduler_procs.append(proc)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,

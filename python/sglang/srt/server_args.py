@@ -604,7 +604,7 @@ class ServerArgs:
 
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
-    
+
     # For Agent Server
     enable_agent_serving: bool = False
     agent_server_addr: Optional[str] = "localhost:7878"
@@ -613,6 +613,10 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+
+        # Handle agentic serving before the dummy-model fast path so tests and
+        # dry-run launches get the same public serving contract.
+        self._handle_agentic_serving()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -695,9 +699,6 @@ class ServerArgs:
 
         # Handle elastic expert parallelism.
         self._handle_elastic_ep()
-        
-        # Handle agentic serving mode
-        self._handle_agentic_serving()
 
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
@@ -1649,6 +1650,8 @@ class ServerArgs:
         if self.enable_agent_serving is False:
             self.agent_server_addr = None
             return
+        if self.agent_server_addr is None:
+            self.agent_server_addr = ServerArgs.agent_server_addr
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
